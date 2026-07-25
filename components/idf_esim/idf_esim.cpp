@@ -402,6 +402,9 @@ static uint16_t response_sw(const std::vector<uint8_t>& resp)
     return static_cast<uint16_t>((resp[resp.size() - 2] << 8) | resp[resp.size() - 1]);
 }
 
+static constexpr bool response_sw_ok(uint16_t sw) { return sw == 0x9000 || (sw >> 8) == 0x91; }
+static_assert(response_sw_ok(0x9000) && response_sw_ok(0x9108) && !response_sw_ok(0x9300));
+
 class EsimApduSession {
 public:
     esp_err_t open(std::string& message)
@@ -543,7 +546,8 @@ private:
                 return ESP_ERR_NO_MEM;
             }
             out.insert(out.end(), resp.begin(), resp.end() - 2);
-            if (sw == 0x9000) return ESP_OK;
+            // 91xx 表示命令已成功且模组将执行 SIM REFRESH；SW2 是主动命令长度，不是错误码。
+            if (response_sw_ok(sw)) return ESP_OK;
             if ((sw >> 8) != 0x61) {
                 message = status_word_text(sw);
                 return ESP_FAIL;
