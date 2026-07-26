@@ -73,8 +73,6 @@ bool idf_modem_sms_health_check(std::string& summary);
 void idf_modem_begin_esim_operation(void);
 void idf_modem_end_esim_operation(void);
 bool idf_modem_esim_operation_active(void);
-// eSIM 启停会触发 SIM REFRESH，期间 CPIN 可能短暂非 READY；通知热插拔检测暂时忽略该瞬态。
-void idf_modem_expect_sim_refresh(void);
 // 启用/切换/禁用 eSIM Profile 后调用：清除缓存的卡相关身份(号码/ICCID/IMSI/运营商/APN)
 // 并请求一次采样，使概览重读新生效 Profile 的信息，而不是沿用旧卡缓存值。
 void idf_modem_invalidate_sim_identity(void);

@@ -24,13 +24,13 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_log.h"
+#include "idf_util.h"
 #include "apps/esp_sntp.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
 static const char* TAG = "idf_wifi";
 static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
-static constexpr EventBits_t WIFI_FAIL_BIT = BIT1;
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr const char* AP_SSID_PREFIX = "SMS-Forwarder-";
 static constexpr gpio_num_t PROVISION_BUTTON_PIN = GPIO_NUM_9;
@@ -135,19 +135,6 @@ static bool sta_can_connect()
            s_sta_configured.load(std::memory_order_relaxed);
 }
 
-static std::string format_epoch_local(time_t epoch, int tz_offset_min)
-{
-    if (epoch < 1700000000) return {};
-    time_t shifted = epoch + static_cast<time_t>(tz_offset_min) * 60;
-    struct tm tmv = {};
-    gmtime_r(&shifted, &tmv);
-    char buf[40];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
-    return std::string(buf);
-}
-
 static std::atomic<bool> s_ntp_first_logged{false};
 static std::atomic<int64_t> s_ntp_manual_us{-1};
 
@@ -195,7 +182,7 @@ static void sntp_sync_cb(timeval*)
 
     time_t now = time(nullptr);
     // 本回调在 tiT(lwip) 小栈上执行：只取时区，绝不深拷贝整个 IdfConfig(会爆栈)
-    std::string local = format_epoch_local(now, idf_config_get_tz_offset());
+    std::string local = idf_util_format_epoch_local(static_cast<uint32_t>(now), idf_config_get_tz_offset());
     if (local.empty()) {
         idf_logf("NTP 时间同步成功，epoch=%ld", static_cast<long>(now));
     } else {
@@ -322,7 +309,6 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         s_sta_connected.store(false, std::memory_order_relaxed);
         if (s_wifi_event_group) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
         // 前几次断开立即重连(快速恢复瞬断)；持续失败后退避，交给 15s 看门狗定时器，
         // 避免错误密码/信号差时无间隔连接风暴打断配网 AP 和 WiFi 扫描
@@ -355,7 +341,6 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             ESP_LOGW(TAG, "WiFi 记忆任务创建失败，本次连接不自动记入历史列表");
         }
         if (s_wifi_event_group) {
-            xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         }
         ApState ap = ap_state_snapshot();
@@ -1198,7 +1183,7 @@ esp_err_t idf_wifi_reconnect(void)
 {
     if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
     if (!sta_can_connect()) return ESP_ERR_INVALID_STATE;
-    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     return esp_wifi_connect();
 }
 
@@ -1220,32 +1205,11 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
     s_has_sta_credentials.store(!ssid.empty(), std::memory_order_relaxed);
     s_sta_configured.store(true, std::memory_order_relaxed);
     s_provisioning.store(true, std::memory_order_relaxed);
-    if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     err = esp_wifi_connect();
     ESP_LOGI(TAG, "配网：保存并连接 %s", ssid.c_str());
     idf_logf("配网热点内保存 WiFi 并尝试连接: %s", ssid.c_str());
     return err;
-}
-
-static void json_escape_append(std::string& out, const std::string& value)
-{
-    for (char ch : value) {
-        switch (ch) {
-            case '\\': out += "\\\\"; break;
-            case '"': out += "\\\""; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(ch) < 0x20) {
-                    char buf[7];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
-                    out += buf;
-                } else {
-                    out += ch;
-                }
-        }
-    }
 }
 
 esp_err_t idf_wifi_scan_json(std::string& out_json)
@@ -1295,7 +1259,7 @@ esp_err_t idf_wifi_scan_json(std::string& out_json)
         if (!first) out_json += ",";
         first = false;
         out_json += "{\"ssid\":\"";
-        json_escape_append(out_json, ssid);
+        idf_util_json_escape_append(out_json, ssid);
         char tail[96];
         snprintf(tail, sizeof(tail), "\",\"rssi\":%d,\"enc\":%d}",
                  records[i].rssi,

@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_log.h"
+#include "idf_util.h"
 #include "nvs.h"
 
 static const char* TAG = "idf_modem";
@@ -61,19 +62,12 @@ static std::atomic<int> s_reset_request{0};  // 1=AT软重启，2=EN硬重启；
 static bool s_data_mode_retry_pending = false;
 static uint8_t s_data_mode_retry_count = 0;
 static TickType_t s_next_data_mode_retry = 0;
-static int s_logged_csq = -1;
-static int s_logged_ber = -1;
-static int s_logged_rsrp = 999;
-static int s_logged_rsrq = 999;
-static int s_logged_sinr = 999;
-static bool s_logged_detail_valid = false;
 static std::atomic<int> s_logged_sms_storage_code{-1};  // -1=未知，0=MT，1=ME，2=SM
 static bool s_identity_static_attempted = false;
 static bool s_identity_network_attempted = false;
 static std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
 static std::atomic<uint32_t> s_status_sample_requests{0};
 static std::atomic<uint32_t> s_esim_operation_depth{0};
-static std::atomic<int64_t> s_sim_refresh_guard_until_us{0};
 
 void idf_modem_signal_event(void);
 
@@ -98,18 +92,9 @@ static void cleanup_start_resources()
     s_urc_buffer.clear();
 }
 
-static std::string trim(std::string value)
-{
-    size_t start = 0;
-    while (start < value.size() && isspace(static_cast<unsigned char>(value[start]))) ++start;
-    size_t end = value.size();
-    while (end > start && isspace(static_cast<unsigned char>(value[end - 1]))) --end;
-    return value.substr(start, end - start);
-}
-
 static bool parse_long_token(const std::string& value, long& out)
 {
-    std::string text = trim(value);
+    std::string text = idf_util_trim_copy(value);
     if (text.empty()) return false;
     errno = 0;
     char* end = nullptr;
@@ -128,7 +113,7 @@ static bool parse_comma_longs(const std::string& text, long* values, int max_val
     while (start < text.size() && count < max_values) {
         size_t comma = text.find(',', start);
         std::string part = text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-        part = trim(part);
+        part = idf_util_trim_copy(part);
         long value = 0;
         if (part.empty() || !parse_long_token(part, value)) return false;
         values[count++] = value;
@@ -156,7 +141,7 @@ static int at_final_result(const std::string& resp)
     while (pos < resp.size()) {
         size_t end = resp.find_first_of("\r\n", pos);
         if (end == std::string::npos) end = resp.size();
-        std::string line = trim(resp.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(resp.substr(pos, end - pos));
         if (line == "OK") return 1;
         if (line == "ERROR" || line.rfind("+CMS ERROR", 0) == 0 ||
             line.rfind("+CME ERROR", 0) == 0) return -1;
@@ -205,7 +190,7 @@ static std::string first_payload_line(const std::string& resp, const char* cmd =
     while (pos < resp.size()) {
         size_t end = resp.find('\n', pos);
         if (end == std::string::npos) end = resp.size();
-        std::string line = trim(resp.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(resp.substr(pos, end - pos));
         if (line_is_payload(line, cmd)) return line;
         pos = end + 1;
     }
@@ -218,7 +203,7 @@ static std::string first_digits_line(const std::string& resp, size_t min_len, si
     while (pos < resp.size()) {
         size_t end = resp.find('\n', pos);
         if (end == std::string::npos) end = resp.size();
-        std::string line = trim(resp.substr(pos, end - pos));
+        std::string line = idf_util_trim_copy(resp.substr(pos, end - pos));
         bool digits = !line.empty();
         for (char ch : line) digits = digits && isdigit(static_cast<unsigned char>(ch));
         if (digits && line.size() >= min_len && line.size() <= max_len) return line;
@@ -504,6 +489,17 @@ static void append_capped(std::string& out, const uint8_t* data, size_t len, siz
     out.append(reinterpret_cast<const char*>(data), len);
 }
 
+static void preserve_sms_urc_from_response(const std::string& response)
+{
+    if (response.find("+CMT:") != std::string::npos ||
+        response.find("+CMTI:") != std::string::npos ||
+        response.find("+CLIP:") != std::string::npos ||
+        response.find("RING") != std::string::npos) {
+        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
+        append_urc_text(response);
+    }
+}
+
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
 {
     if (!s_started) return ESP_ERR_INVALID_STATE;
@@ -537,13 +533,7 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
             if (scan.size() > 32) scan.erase(0, scan.size() - 32);
         }
     }
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
+    preserve_sms_urc_from_response(response);
     xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
@@ -581,13 +571,7 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
             if (scan.size() > 64) scan.erase(0, scan.size() - 64);
         }
     }
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
+    preserve_sms_urc_from_response(response);
     xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
@@ -659,13 +643,7 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         }
     }
 
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
+    preserve_sms_urc_from_response(response);
     xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
@@ -695,13 +673,6 @@ static bool parse_csq(const std::string& resp, int& csq, int& ber)
     return true;
 }
 
-static const char* format_ber(int ber, char* buf, size_t len)
-{
-    if (ber >= 99) return "未知";
-    snprintf(buf, len, "%d", ber);
-    return buf;
-}
-
 static bool parse_cereg(const std::string& resp, int& stat)
 {
     size_t p = resp.find("+CEREG:");
@@ -711,14 +682,14 @@ static bool parse_cereg(const std::string& resp, int& stat)
     if (!token) return false;
     std::string rest = token + strlen("+CEREG:");
     size_t comma = rest.find(',');
-    std::string first = trim(rest.substr(0, comma));
+    std::string first = idf_util_trim_copy(rest.substr(0, comma));
     long first_value = -1;
     if (!parse_long_token(first, first_value)) return false;
 
     long status_value = first_value;
     if (comma != std::string::npos) {
         size_t second_end = rest.find(',', comma + 1);
-        std::string second = trim(rest.substr(
+        std::string second = idf_util_trim_copy(rest.substr(
             comma + 1, second_end == std::string::npos ? std::string::npos : second_end - comma - 1));
         long second_value = -1;
         // 查询响应是 +CEREG: <n>,<stat>；URC 是 +CEREG: <stat>[,<tac>,...]，
@@ -854,7 +825,7 @@ static std::string hex_encode_ascii(const std::string& text)
 static bool parse_http_url(const std::string& raw_url, std::string& protocol,
                            std::string& host, std::string& path, std::string& error)
 {
-    std::string url = trim(raw_url);
+    std::string url = idf_util_trim_copy(raw_url);
     if (url.empty()) url = IDF_KEEPALIVE_DEFAULT_URL;
     if (url.size() > 240) {
         error = "蜂窝HTTP URL过长";
@@ -886,7 +857,7 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     }
     size_t hash = path.find('#');
     if (hash != std::string::npos) path.resize(hash);
-    host = trim(host);
+    host = idf_util_trim_copy(host);
     if (host.empty() || host.find('"') != std::string::npos ||
         host.find(' ') != std::string::npos || path.find('"') != std::string::npos ||
         path.find(' ') != std::string::npos) {
@@ -912,17 +883,6 @@ static void append_no_cache_query(std::string& path)
              static_cast<unsigned long long>(esp_timer_get_time() / 1000ULL),
              static_cast<unsigned>(esp_random()));
     path += buf;
-}
-
-static void preserve_sms_urc_from_response(const std::string& response)
-{
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
 }
 
 static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
@@ -1068,7 +1028,7 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
                 continue;
             }
             if (ch == '\r' || ch == '\n') {
-                std::string line = trim(head);
+                std::string line = idf_util_trim_copy(head);
                 if (!line.empty()) {
                     if (starts_with(line, "+MHTTPURC: \"err\"")) {
                         parse_mhttp_head(line, http_id, result, complete, error);
@@ -1131,7 +1091,7 @@ static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
     size_t eol = resp.find('\n', p);
     if (eol == std::string::npos) eol = resp.size();
     if (comma == std::string::npos || comma >= eol) return false;
-    ip = trim(resp.substr(comma + 1, eol - comma - 1));
+    ip = idf_util_trim_copy(resp.substr(comma + 1, eol - comma - 1));
     ip.erase(std::remove(ip.begin(), ip.end(), '"'), ip.end());
     if (!valid_ipv4_address(ip)) return false;
     return true;
@@ -1188,7 +1148,7 @@ static bool parse_muestats_cell(const std::string& resp, IdfModemStatus& patch)
     while (pos <= line.size() && count < 12) {
         size_t comma = line.find(',', pos);
         if (comma == std::string::npos) comma = line.size();
-        parts[count++] = trim(line.substr(pos, comma - pos));
+        parts[count++] = idf_util_trim_copy(line.substr(pos, comma - pos));
         if (comma == line.size()) break;
         pos = comma + 1;
     }
@@ -1262,23 +1222,6 @@ static void sample_signal_detail_once(void)
     if (next_rsrp == 999 && next_rsrq == 999 && next_sinr == 999) return;
 
     update_status(patch, false, true);
-
-    bool first = !s_logged_detail_valid;
-    bool duplicate = s_logged_detail_valid &&
-                     next_rsrp == s_logged_rsrp &&
-                     next_rsrq == s_logged_rsrq &&
-                     next_sinr == s_logged_sinr;
-    bool changed = !duplicate &&
-                   (first ||
-                    (next_rsrp != 999 && (s_logged_rsrp == 999 || abs(next_rsrp - s_logged_rsrp) >= 6)) ||
-                    (next_rsrq != 999 && (s_logged_rsrq == 999 || abs(next_rsrq - s_logged_rsrq) >= 4)) ||
-                    (next_sinr != 999 && (s_logged_sinr == 999 || abs(next_sinr - s_logged_sinr) >= 6)));
-    if (changed) {
-        s_logged_detail_valid = true;
-        s_logged_rsrp = next_rsrp;
-        s_logged_rsrq = next_rsrq;
-        s_logged_sinr = next_sinr;
-    }
 }
 
 static bool model_skips_cgact(void)
@@ -1300,7 +1243,7 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
                                             uint32_t inactive_timeout_ms)
 {
     std::string resp;
-    std::string apn = trim(cfg.apn);
+    std::string apn = idf_util_trim_copy(cfg.apn);
     // 数据漫游策略：未勾选"允许数据漫游"且当前处于漫游(CEREG=5)时不激活蜂窝数据。
     // 启动阶段注册状态未知(stat=-1)会乐观激活，注册完成后由 enforce_roaming_data_policy 兜底关闭。
     bool want_data = cfg.dataEnabled &&
@@ -1511,7 +1454,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
              protocol.c_str(), host.c_str(), path.c_str());
 
     std::string resp;
-    std::string apn = trim(config.apn);
+    std::string apn = idf_util_trim_copy(config.apn);
     if (!apn.empty() && apn.find('"') == std::string::npos) {
         std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
         cmd += apn;
@@ -1573,16 +1516,6 @@ static void sample_signal_once(void)
     patch.csq = csq;
     patch.ber = ber;
     update_status(patch, false, true);
-    bool first = s_logged_csq < 0;
-    bool changed = first || abs(csq - s_logged_csq) >= 3 || ber != s_logged_ber ||
-                   csq == 99 || s_logged_csq == 99;
-    if (changed) {
-        s_logged_csq = csq;
-        s_logged_ber = ber;
-        char ber_buf[16];
-        const char* ber_text = format_ber(ber, ber_buf, sizeof(ber_buf));
-        ESP_LOGD(TAG, "%s CSQ=%d/31 BER=%s", first ? "signal" : "signal changed", csq, ber_text);
-    }
 }
 
 static bool sample_identity_once(bool log_summary = false, bool include_network_fields = true)
@@ -1625,7 +1558,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     auto parse_iccid_response = [](const std::string& raw) {
         std::string line = first_payload_line(raw);
         size_t p = line.find(':');
-        std::string value = trim(p == std::string::npos ? line : line.substr(p + 1));
+        std::string value = idf_util_trim_copy(p == std::string::npos ? line : line.substr(p + 1));
         value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
         for (char& ch : value) {
             if (ch == 'f') ch = 'F';
@@ -1954,7 +1887,8 @@ static bool s_reinit_pending = false;
 
 static bool handle_reset_request_if_any(void)
 {
-    // 逻辑通道尚未关闭时重启会把 eSIM 操作截断；REFRESH 后上层主动请求的重启仍允许执行。
+    // 逻辑通道尚未关闭时重启会把 eSIM 操作截断；切卡成功后 idf_esim 请求的软重启
+    // 会等到 APDU 会话结束(深度归零)才执行。
     if (s_esim_operation_depth.load(std::memory_order_relaxed) != 0) return false;
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
     if (request == 0) return false;
@@ -2237,7 +2171,6 @@ static void modem_task(void*)
         // 拔出(有卡→无卡)：标记未就绪并清空身份，避免概览沿用旧卡信息。
         int64_t sim_check_now_us = esp_timer_get_time();
         if (sim_check_now_us >= sim_check_not_before_us &&
-            sim_check_now_us >= s_sim_refresh_guard_until_us.load(std::memory_order_relaxed) &&
             (last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
             at_channel_idle_now()) {
             last_sim_check = now;
@@ -2401,13 +2334,6 @@ void idf_modem_end_esim_operation(void)
 bool idf_modem_esim_operation_active(void)
 {
     return s_esim_operation_depth.load(std::memory_order_relaxed) != 0;
-}
-
-void idf_modem_expect_sim_refresh(void)
-{
-    // eSIM REFRESH 会让 CPIN 短暂掉线；若按物理拔插处理，恢复 READY 时会误触发硬重启。
-    s_sim_refresh_guard_until_us.store(esp_timer_get_time() + 90LL * 1000LL * 1000LL,
-                                       std::memory_order_relaxed);
 }
 
 static std::atomic<void (*)(void)> s_sim_identity_hook{nullptr};

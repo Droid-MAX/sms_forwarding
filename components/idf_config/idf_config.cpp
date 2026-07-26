@@ -1131,20 +1131,6 @@ static esp_err_t commit_config_update(IdfConfig& next, const IdfConfig& base)
     return err;
 }
 
-esp_err_t idf_config_save(void)
-{
-    esp_err_t err = ensure_config_mutex();
-    if (err != ESP_OK) return err;
-    // 快照必须在 persist 锁内取：锁外快照到提交之间完成的单字段保存会被整体回写覆盖
-    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
-    IdfConfig next = idf_config_get();
-    normalize_config(next);
-    err = save_config_to_nvs(next);
-    if (err == ESP_OK) err = replace_config(next);
-    xSemaphoreGive(s_persist_mutex);
-    return err;
-}
-
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
 {
     if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return ESP_ERR_INVALID_ARG;
@@ -1748,34 +1734,6 @@ IdfConfigWebView idf_config_get_web_view(void)
     return view;
 }
 
-IdfSchedStatusView idf_config_get_sched_view(void)
-{
-    IdfSchedStatusView view;
-    if (ensure_config_mutex() != ESP_OK) return view;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) view.tasks[i] = s_config.schedTasks[i];
-    view.tzOffsetMin = s_config.tzOffsetMin;
-    xSemaphoreGive(s_config_mutex);
-    return view;
-}
-
-IdfKeepaliveStatusView idf_config_get_keepalive_status_view(void)
-{
-    IdfKeepaliveStatusView view;
-    if (ensure_config_mutex() != ESP_OK) return view;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    view.kaEnabled = s_config.kaEnabled;
-    view.kaIntervalDays = s_config.kaIntervalDays;
-    view.kaAction = s_config.kaAction;
-    view.kaTarget = s_config.kaTarget;
-    view.kaUrl = s_config.kaUrl;
-    view.kaProfile = s_config.kaProfile;
-    view.kaLastTime = s_config.kaLastTime;
-    view.tzOffsetMin = s_config.tzOffsetMin;
-    xSemaphoreGive(s_config_mutex);
-    return view;
-}
-
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void)
 {
     IdfKeepaliveRunView view;
@@ -1915,16 +1873,6 @@ bool idf_config_get_push_channel(uint8_t channel, IdfPushChannel& out)
 
 // 以下布尔/小字段访问器都在锁内直接求值：全量快照要深拷贝 42 个 std::string，
 // 在每个 HTTP 请求上都做一次会造成持续的堆分配抖动与碎片化
-bool idf_config_has_sta_credentials(void)
-{
-    // normalize 保证列表连续，槽位 0 非空即代表有可用凭据
-    if (ensure_config_mutex() != ESP_OK) return false;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    bool ok = !s_config.wifiNetworks[0].ssid.empty();
-    xSemaphoreGive(s_config_mutex);
-    return ok;
-}
-
 std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void)
 {
     std::vector<IdfWifiNetwork> nets;
@@ -2010,15 +1958,6 @@ bool idf_config_email_configured(void)
     bool ok = email_configured_locked();
     xSemaphoreGive(s_config_mutex);
     return ok;
-}
-
-int idf_config_enabled_push_count(void)
-{
-    if (ensure_config_mutex() != ESP_OK) return 0;
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    int count = enabled_push_count_locked();
-    xSemaphoreGive(s_config_mutex);
-    return count;
 }
 
 // 常数时间比对：逐字节累积差异，不因首字节不匹配提前返回，避免计时侧信道
