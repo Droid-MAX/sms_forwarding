@@ -30,6 +30,9 @@ struct IdfModemStatus {
     std::string apnSim;
     std::string cellIp;
     std::string phone;
+    std::string simState = "unknown";
+    bool simCredentialMatched = false;
+    std::string simUnlockMessage;
 };
 
 struct IdfCellularHttpResult {
@@ -53,6 +56,8 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_request_reset(bool hard_reset);
+// 请求模组任务重新检查 SIM 锁；allow_puk=true 仅用于网页二次确认后的单次 PUK 操作。
+esp_err_t idf_modem_request_sim_unlock(bool allow_puk);
 bool idf_modem_take_urc(std::string& out);
 // 等待模组事件(新 URC 入缓冲/外部唤醒)，超时返回 false；用于替代固定轮询延时
 bool idf_modem_wait_event(uint32_t timeout_ms);

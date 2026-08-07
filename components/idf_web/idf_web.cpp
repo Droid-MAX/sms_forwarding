@@ -385,6 +385,10 @@ static esp_err_t handle_status(httpd_req_t* req)
              modem.identityFresh ? "true" : "false",
              WEB_ASSET_HASH);
     body += buf;
+    json_prop(body, "simState", modem.simState); body += ",";
+    body += "\"simCredentialMatched\":";
+    body += modem.simCredentialMatched ? "true," : "false,";
+    json_prop(body, "simUnlockMessage", modem.simUnlockMessage); body += ",";
     snprintf(buf, sizeof(buf), "\"tz\":%d,", cfg.tzOffsetMin);
     body += buf;
     snprintf(buf, sizeof(buf), "\"nowEpoch\":%ld,", static_cast<long>(now));
@@ -545,6 +549,23 @@ static esp_err_t send_config_json(httpd_req_t* req)
     body += "\"callNotifyEnabled\":";
     body += cfg.callNotifyEnabled ? "true" : "false";
     body += ",";
+    snprintf(buf, sizeof(buf), "\"wifiTxPowerQuarterDbm\":%u,", cfg.wifiTxPowerQuarterDbm);
+    body += buf;
+    body += "\"simCredentials\":[";
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        if (i) body += ",";
+        const IdfSimCredentialView& item = cfg.simCredentials[i];
+        body += "{";
+        json_prop(body, "iccid", item.iccid); body += ",";
+        snprintf(buf, sizeof(buf),
+                 "\"pinSet\":%s,\"pukSet\":%s,\"pinMax\":%u,\"pukMax\":%u,"
+                 "\"pinFailed\":%u,\"pukFailed\":%u}",
+                 item.pinSet ? "true" : "false", item.pukSet ? "true" : "false",
+                 item.pinMaxAttempts, item.pukMaxAttempts,
+                 item.pinFailedAttempts, item.pukFailedAttempts);
+        body += buf;
+    }
+    body += "],";
     body += "\"wifiNetworks\":[";
     for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
         if (i) body += ",";
@@ -1005,13 +1026,18 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     WebModemActionGuard modem_action;
     bool needs_modem = (action == "restart" || action == "hardreset" ||
                         action == "signal" || action == "operator" || action == "imei");
-    if ((action == "restart" || action == "hardreset") && req->method != HTTP_POST) {
+    if ((action == "restart" || action == "hardreset" || action == "sim-puk") && req->method != HTTP_POST) {
         set_json_no_cache(req);
-        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"模组重启需要 POST\"}");
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"该操作需要 POST\"}");
     }
     if (needs_modem && !modem_action.begin(req)) return ESP_OK;
 
-    if (action == "restart" || action == "hardreset") {
+    if (action == "sim-puk") {
+        esp_err_t err = idf_modem_request_sim_unlock(true);
+        success = err == ESP_OK;
+        message = success ? "PUK 解锁请求已提交，请查看 SIM 状态" : esp_err_to_name(err);
+        if (success) idf_log_line("网页已确认执行一次 SIM PUK 解锁");
+    } else if (action == "restart" || action == "hardreset") {
         bool hard = action == "hardreset";
         esp_err_t err = idf_modem_request_reset(hard);
         success = (err == ESP_OK);
@@ -1280,6 +1306,21 @@ static void parse_sched_tasks_form(const IdfFormFields& fields,
     }
 }
 
+static void parse_sim_credentials_form(const IdfFormFields& fields,
+                                       IdfSimCredential items[IDF_MAX_SIM_CREDENTIALS])
+{
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        char key[20];
+        snprintf(key, sizeof(key), "sim%dIccid", i); items[i].iccid = field_text(fields, key);
+        snprintf(key, sizeof(key), "sim%dPin", i); items[i].pin = field_text(fields, key);
+        snprintf(key, sizeof(key), "sim%dPuk", i); items[i].puk = field_text(fields, key);
+        snprintf(key, sizeof(key), "sim%dPinMax", i); items[i].pinMaxAttempts = field_u8(fields, key, 1);
+        snprintf(key, sizeof(key), "sim%dPukMax", i); items[i].pukMaxAttempts = field_u8(fields, key, 1);
+        snprintf(key, sizeof(key), "sim%dResetPin", i); if (has_field(fields, key)) items[i].pinFailedAttempts = UINT8_MAX;
+        snprintf(key, sizeof(key), "sim%dResetPuk", i); if (has_field(fields, key)) items[i].pukFailedAttempts = UINT8_MAX;
+    }
+}
+
 static esp_err_t handle_save(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
@@ -1365,14 +1406,17 @@ static esp_err_t handle_save(httpd_req_t* req)
             snprintf(key, sizeof(key), "wifi%dPass", i);
             nets[i].pass = field_text(fields, key);
         }
-        esp_err_t err = idf_config_save_wifi_networks(nets, true);
+        uint8_t wifi_tx_power = field_u8(fields, "wifiTxPowerQuarterDbm", 34);
+        esp_err_t err = idf_config_save_wifi_networks(nets, true, wifi_tx_power);
         if (err == ESP_ERR_INVALID_ARG) {
             set_no_cache_headers(req);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                "SSID 最长 32 字节、密码最长 64 字节");
+                                "WiFi 网络或发射功率档位无效");
             return ESP_OK;
         }
         if (err != ESP_OK) return fail(err);
+        esp_err_t apply_err = idf_wifi_set_tx_power(wifi_tx_power);
+        if (apply_err != ESP_OK) idf_logf("WiFi 功率已保存，立即应用失败: %s", esp_err_to_name(apply_err));
         return ok("网页保存 WiFi 网络列表");
     }
 
@@ -1485,21 +1529,40 @@ static esp_err_t handle_save(httpd_req_t* req)
 
     if (sim_form) {
         IdfSimSettingsView before = idf_config_get_sim_settings_view();
+        IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS];
+        parse_sim_credentials_form(fields, credentials);
         esp_err_t err = idf_config_save_sim(has_field(fields, "dataEnabled"),
                                             has_field(fields, "roamingEnabled"),
                                             field_text(fields, "apn"),
                                             field_text(fields, "operatorPlmn"),
-                                            field_text(fields, "phoneNumber"));
+                                            field_text(fields, "phoneNumber"),
+                                            credentials);
+        if (err == ESP_ERR_INVALID_ARG) {
+            set_no_cache_headers(req);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SIM ICCID/PIN/PUK 格式无效");
+            return ESP_OK;
+        }
         if (err != ESP_OK) return fail(err);
         IdfSimSettingsView after = idf_config_get_sim_settings_view();
         bool data_changed = before.dataEnabled != after.dataEnabled || before.apn != after.apn ||
                             before.roamingEnabled != after.roamingEnabled;
         bool operator_changed = before.operatorPlmn != after.operatorPlmn;
+        bool credentials_changed = false;
+        for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+            const IdfSimCredential& a = before.credentials[i];
+            const IdfSimCredential& b = after.credentials[i];
+            credentials_changed = credentials_changed || a.iccid != b.iccid || a.pin != b.pin ||
+                                  a.puk != b.puk || a.pinMaxAttempts != b.pinMaxAttempts ||
+                                  a.pukMaxAttempts != b.pukMaxAttempts ||
+                                  a.pinFailedAttempts != b.pinFailedAttempts ||
+                                  a.pukFailedAttempts != b.pukFailedAttempts;
+        }
 
         httpd_resp_set_type(req, "text/plain");
         set_no_cache_headers(req);
         httpd_resp_sendstr(req, "OK");
         idf_log_line("网页保存蜂窝设置");
+        if (credentials_changed) idf_modem_request_sim_unlock(false);
         if (!data_changed && !operator_changed) return ESP_OK;
 
         ModemApplyTaskArg* arg = new (std::nothrow) ModemApplyTaskArg();

@@ -9,7 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.1.3";
+static constexpr const char* IDF_FW_VERSION = "1.1.4";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
 static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "http://gg.incrafttime.top/api/payload?size=64342";
@@ -19,6 +19,17 @@ static constexpr int IDF_MAX_SCHED_TASKS = 6;
 // 历史 WiFi 列表：连接前先扫描，与列表匹配后直连在场且信号最好的一组(取代固定
 // 主备槽位的顺序盲试)。槽位 0 为最近一次配网保存的网络，兼容旧版单组配置。
 static constexpr int IDF_MAX_WIFI_NETWORKS = 5;
+static constexpr int IDF_MAX_SIM_CREDENTIALS = 5;
+
+struct IdfSimCredential {
+    std::string iccid;
+    std::string pin;
+    std::string puk;
+    uint8_t pinMaxAttempts = 1;
+    uint8_t pukMaxAttempts = 1;
+    uint8_t pinFailedAttempts = 0;
+    uint8_t pukFailedAttempts = 0;
+};
 
 struct IdfWifiNetwork {
     std::string ssid;
@@ -53,6 +64,7 @@ struct IdfConfig {
     // OTA 回滚到旧固件仍能读到最近配网的网络
     IdfWifiNetwork wifiNetworks[IDF_MAX_WIFI_NETWORKS];
     bool wifiFromFallback = false;
+    uint8_t wifiTxPowerQuarterDbm = 34;  // ESP-IDF 单位为 0.25dBm；34=8.5dBm
 
     std::string smtpServer;
     int smtpPort = 465;
@@ -94,6 +106,7 @@ struct IdfConfig {
     std::string apn;
     std::string operatorPlmn;
     std::string phoneNumber;
+    IdfSimCredential simCredentials[IDF_MAX_SIM_CREDENTIALS];
 
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
     IdfSchedTask schedTasks[IDF_MAX_SCHED_TASKS];
@@ -106,7 +119,7 @@ esp_err_t idf_config_load(void);
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass);
 // 网页整表保存历史 WiFi 列表；preserve_blank_pass=true 时已存网络密码留空表示不修改
 esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS],
-                                        bool preserve_blank_pass);
+                                        bool preserve_blank_pass, uint8_t wifi_tx_power_quarter_dbm);
 // 类手机行为：STA 连接成功后记住当前网络并维持"最近使用"序(LRU)：
 // 已在首位直接返回(常驻网络重连零开销)；在列表但不在首位提到首位；
 // 新网络/密码变更上位插入，满员挤掉末位(最久未用)的一组
@@ -132,7 +145,9 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
                                           bool sms_health_notify);
 esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS]);
 esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std::string& apn,
-                              const std::string& operator_plmn, const std::string& phone_number);
+                              const std::string& operator_plmn, const std::string& phone_number,
+                              const IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS]);
+esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk, bool success);
 std::string idf_config_export_text(bool full_export);
 esp_err_t idf_config_import_text(const std::string& text, int* applied_count);
 esp_err_t idf_config_factory_reset(void);
@@ -159,6 +174,16 @@ struct IdfConfigStatusView {
 struct IdfWifiNetworkView {
     std::string ssid;
     bool passSet = false;
+};
+
+struct IdfSimCredentialView {
+    std::string iccid;
+    bool pinSet = false;
+    bool pukSet = false;
+    uint8_t pinMaxAttempts = 1;
+    uint8_t pukMaxAttempts = 1;
+    uint8_t pinFailedAttempts = 0;
+    uint8_t pukFailedAttempts = 0;
 };
 
 // /config.json 专用快照：不带定时任务数组，避免面板切换/保存后刷新时全量深拷贝
@@ -195,7 +220,9 @@ struct IdfConfigWebView {
     std::string kaProfile;
     bool netLedEnabled = true;
     bool callNotifyEnabled = true;
+    uint8_t wifiTxPowerQuarterDbm = 34;
     IdfWifiNetworkView wifiNetworks[IDF_MAX_WIFI_NETWORKS];
+    IdfSimCredentialView simCredentials[IDF_MAX_SIM_CREDENTIALS];
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
 };
 
@@ -231,6 +258,12 @@ struct IdfSimSettingsView {
     bool roamingEnabled = true;
     std::string apn;
     std::string operatorPlmn;
+    IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS];
+};
+
+struct IdfSimUnlockView {
+    bool found = false;
+    IdfSimCredential credential;
 };
 
 struct IdfSmsProcessView {
@@ -285,6 +318,7 @@ IdfConfigWebView idf_config_get_web_view(void);
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void);
 IdfSchedRunView idf_config_get_sched_run_view(int index);
 IdfSimSettingsView idf_config_get_sim_settings_view(void);
+IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid);
 IdfSmsProcessView idf_config_get_sms_process_view(void);
 IdfPushForwardView idf_config_get_push_forward_view(void);
 IdfPushNotifyView idf_config_get_push_notify_view(void);

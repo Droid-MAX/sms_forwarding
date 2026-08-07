@@ -36,8 +36,8 @@ static constexpr size_t CONCAT_SLOTS = 5;
 static constexpr size_t CONCAT_PARTS = 10;
 // 30s(Arduino 原值)在真实网络下太短：SIM 满被拒收的分段要等 SMSC 按分钟级
 // 间隔重投，+CMTI 丢失时也要等轮询兜底，30s 一到就强拼出"[缺失分段]"残句。
-// 放宽到 5 分钟，期间由 CONCAT_HUNT_POLL_MS 快轮询主动补齐缺失分段。
-static constexpr int64_t CONCAT_TIMEOUT_US = 300LL * 1000LL * 1000LL;
+// 直投仍可能遇到运营商分钟级重投，等待 15 分钟再带缺段标记转发。
+static constexpr int64_t CONCAT_TIMEOUT_US = 15LL * 60LL * 1000LL * 1000LL;
 // 存在未拼完的长短信时的加速轮询间隔：缺失分段若已落在 SIM 里(通知丢失)，
 // 10s 内即可捞回，而不是等最长 60s 的常规轮询
 static constexpr uint32_t CONCAT_HUNT_POLL_MS = 10000;
@@ -1011,7 +1011,7 @@ static void sms_task(void*)
         if (modem.atReady && !configured) {
             std::string ignored;
             idf_modem_send_at("AT+CMGF=0", 1200, ignored);
-            idf_modem_send_at("AT+CNMI=2,1,0,0,0", 1200, ignored);
+            idf_modem_send_at("AT+CNMI=2,2,0,0,0", 1200, ignored);
             configured = true;
             update_status(true, false);
             idf_log_line("短信接收(PDU/存储通知)已配置");
@@ -1029,7 +1029,7 @@ static void sms_task(void*)
                     idf_modem_reassert_sms_storage();
                     reassert_step = 3;
                 } else {
-                    idf_modem_send_at("AT+CNMI=2,1,0,0,0", 1200, ignored);
+                    idf_modem_send_at("AT+CNMI=2,2,0,0,0", 1200, ignored);
                     reassert_step = 0;
                     backfill_after_reassert = true;
                 }

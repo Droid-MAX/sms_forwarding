@@ -54,6 +54,11 @@
       }
       return html;
     }
+    function buildWifiTxPowerOptions(current) {
+      var levels = [[8,'2'],[20,'5'],[28,'7'],[34,'8.5（SuperMini 推荐）'],[44,'11'],[52,'13'],[56,'14'],[60,'15'],[66,'16.5'],[72,'18'],[80,'20']];
+      current = Number(current) || 34;
+      return levels.map(function(x){ return '<option value="' + x[0] + '"' + (x[0] === current ? ' selected' : '') + '>' + x[1] + ' dBm</option>'; }).join('');
+    }
     function pushTypeOptions(type) {
       var opts = [
         [1,'POST JSON（通用格式）'], [2,'Bark（iOS推送）'], [3,'GET请求（参数在URL中）'], [4,'钉钉机器人'],
@@ -97,6 +102,23 @@
       if (redacted && set) {
         html += '<label class="schedule-switch" id="' + key + 'ClearWrap' + idx + '" style="margin-top:6px;"><input type="checkbox" name="' + name + 'Clear"> 清除已保存参数</label>';
         html += '<p class="form-hint" id="' + key + 'SavedHint' + idx + '">已保存，留空不修改；填写新值会覆盖。</p>';
+      }
+      return html;
+    }
+    function buildSimCredentials(items) {
+      items = items || [];
+      var html = '';
+      for (var i = 0; i < 5; i++) {
+        var item = items[i] || {}, idx = String(i);
+        html += '<div class="sim-credential">';
+        html += '<div class="form-group"><label>ICCID ' + (i + 1) + '</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="numeric" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" placeholder="完整 ICCID；留空删除本行"></div>';
+        html += '<div class="sim-credential-grid">';
+        html += '<div class="form-group"><label>PIN</label><input class="form-input" type="password" name="sim' + idx + 'Pin" inputmode="numeric" minlength="4" maxlength="8" autocomplete="new-password" placeholder="' + (item.pinSet ? '已保存，留空不修改' : '4–8 位数字') + '"></div>';
+        html += '<div class="form-group"><label>PIN 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PinMax" min="1" max="2" value="' + (item.pinMax || 1) + '"></div>';
+        html += '<div class="form-group"><label>PUK</label><input class="form-input" type="password" name="sim' + idx + 'Puk" inputmode="numeric" minlength="8" maxlength="8" autocomplete="new-password" placeholder="' + (item.pukSet ? '已保存，留空不修改' : '8 位数字') + '"></div>';
+        html += '<div class="form-group"><label>PUK 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PukMax" min="1" max="5" value="' + (item.pukMax || 1) + '"></div>';
+        html += '</div><p class="form-hint">失败计数：PIN ' + (item.pinFailed || 0) + '/' + (item.pinMax || 1) + '，PUK ' + (item.pukFailed || 0) + '/' + (item.pukMax || 1) + '。修改对应凭据会清零该计数。</p>';
+        html += '<div class="btn-row"><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPin"> 保存时重置 PIN 计数</label><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPuk"> 保存时重置 PUK 计数</label></div></div>';
       }
       return html;
     }
@@ -162,7 +184,7 @@
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
         OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
-        WIFI_NETWORKS: buildWifiNetworks(c.wifiNetworks),
+        WIFI_NETWORKS: buildWifiNetworks(c.wifiNetworks), WIFI_TX_POWER_OPTIONS: buildWifiTxPowerOptions(c.wifiTxPowerQuarterDbm), SIM_CREDENTIALS: buildSimCredentials(c.simCredentials),
         NETLED_CHECKED: checked(c.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(c.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
       };
       return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
@@ -196,7 +218,7 @@
       if (name === 'inbox') loadMessages();
       if (name === 'keepalive' || name === 'diagnose') kaLoadStatus();
       if (name === 'keepalive') stLoadStatus();
-      if (name === 'sim') { wifiPrefill(); esimLoadStatus(); }
+      if (name === 'sim') { wifiPrefill(); esimLoadStatus(); loadStatus(); startStatusPoll(); }
       if (name === 'push') { for (var i = 0; i < 5; i++) { toggleChannel(i); updateTypeHint(i); } setupChannels(); parseFwdRules(); renderRules(); }
       if (name === 'atterm') bindAtTerminal();
     }
@@ -1209,6 +1231,7 @@
       if (p === 'powering') return '模组上电中';
       if (p === 'at_ready') return 'AT已就绪';
       if (p === 'registering') return '网络注册中';
+      if (p === 'sim_locked') return 'SIM 已锁定';
       if (p === 'sampling') return '读取信息中';
       if (p === 'ready') return '已就绪';
       if (p === 'failed') return '注册超时';
@@ -1347,6 +1370,14 @@
         ovSet('tCellIp', d.dataEnabled ? (d.cellIp || '获取中') : '— (未启用)');
         ovSet('tPhone', d.phone || '--'); ovSet('tImei', pendingValue(d.imei, d.identityFresh, d)); ovSet('tIccid', pendingValue(d.iccid, d.identityFresh, d));
         ovSet('tImsi', pendingValue(d.imsi, d.identityFresh, d)); ovSet('tApn', apnText(d));
+        var simLock = document.getElementById('simLockStatus');
+        if (simLock) {
+          var lockNames = {ready:'SIM 已就绪', pin:'SIM 正在等待 PIN', puk:'SIM 正在等待 PUK', absent:'未检测到 SIM', other:'SIM 处于不支持的锁定状态', unknown:'SIM 状态未知'};
+          simLock.textContent = (lockNames[d.simState] || d.simState || 'SIM 状态未知') +
+            (d.simCredentialMatched ? '；已匹配 ICCID 凭据' : '') +
+            (d.simUnlockMessage ? '；' + d.simUnlockMessage : '');
+          simLock.className = 'result-box ' + (d.simState === 'ready' ? 'result-success' : (d.simState === 'pin' || d.simState === 'puk' ? 'result-error' : 'result-info'));
+        }
         // WiFi 详细信息卡片(独立卡，原"网络与SIM"里的 WiFi 行已移出)
         ovSet('wfSsid', d.ssid || '--');
         ovSet('wfIp', d.ip || '--'); ovSet('wfGw', d.gw || '--'); ovSet('wfMask', d.mask || '--');
@@ -1536,6 +1567,13 @@
     }
 
     // ---- eSIM 本地管理 ----
+    function simPukUnlock() {
+      if (!confirm('PUK 输错可能永久锁死 SIM。确认使用当前 ICCID 已保存的 PUK，并把已保存 PIN 设置为新 PIN？')) return;
+      csrfFetch('/modem?action=sim-puk', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
+        showToast(d.message || 'PUK 解锁请求已提交', d.success ? 'ok' : 'err');
+        loadStatus();
+      }).catch(function(e){ showToast('PUK 解锁请求失败: ' + e, 'err'); });
+    }
     var esimTimer = null;
     function esimStateText(s) {
       if (s === 'enabled') return '启用';
@@ -1771,7 +1809,7 @@
     // ---- Config backup / OTA ----
     function doExport() { location.href = '/export'; }
     function doExportFull() {
-      if (!confirm('完整导出会包含 WiFi、Web、SMTP 和推送密钥明文。确定继续？')) return;
+      if (!confirm('完整导出会包含 WiFi、Web、SMTP、推送密钥及 SIM PIN/PUK 明文。确定继续？')) return;
       location.href = '/export?full=1';
     }
     function doImport() {

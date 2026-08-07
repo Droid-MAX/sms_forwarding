@@ -30,6 +30,15 @@
               <p class="form-hint">多数 eSIM/数据卡不通过 CNUM 上报本机号码，模组读不到时概览会显示这里的手填值。换卡后请更新或清空，否则会一直显示旧号码。</p></div>
           </div>
         </div>
+        <div class="card">
+          <div class="card-header">SIM PIN / PUK</div>
+          <div class="card-body">
+            <div class="result-box" id="simLockStatus">正在读取 SIM 锁定状态…</div>
+            <p class="form-hint" style="color:var(--error);font-weight:600">凭据只会用于完全匹配的 ICCID。PIN 可自动尝试；PUK 输错可能永久锁卡，只能点击按钮手动执行。</p>
+            <div class="sim-credential-list">%SIM_CREDENTIALS%</div>
+            <button type="button" class="btn btn-danger btn-block" onclick="simPukUnlock()">手动使用 PUK 解锁当前 SIM</button>
+          </div>
+        </div>
         <button type="submit" class="btn btn-primary btn-block btn-save">保存蜂窝设置</button>
         </form>
         <div class="card">
@@ -65,8 +74,9 @@
         <form action="/save" method="POST">
         <input type="hidden" name="wifiListForm" value="1">
         <div class="card">
-          <div class="card-header">历史 WiFi 列表<button type="button" class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
+          <div class="card-header">WiFi 设置与历史列表<button type="button" class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
           <div class="card-body">
+            <div class="form-group"><label class="form-label">WiFi 发射功率</label><select class="form-select" name="wifiTxPowerQuarterDbm">%WIFI_TX_POWER_OPTIONS%</select><p class="form-hint">ESP32-C3 SuperMini 板载天线建议保持 8.5 dBm；更高功率只适合射频和天线质量可靠的硬件，20 dBm 可能导致认证不稳定。</p></div>
             %WIFI_NETWORKS%
             <p class="form-hint">同手机：设备成功连上的网络会自动加入列表；启动 / 掉线重连时先扫描周边，自动连接列表中在场且信号最好的网络。SSID 点击输入框即出扫描候选（首次自动扫描，点“扫描”可刷新），也可手动输入；已存网络密码留空表示不修改，点“删除”并保存即移除该组。保存不打断当前连接，重连或重启后按新列表生效</p>
             <button type="submit" class="btn btn-primary btn-block" style="margin-top:4px;">保存 WiFi 列表</button>

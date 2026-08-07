@@ -189,8 +189,8 @@ def main() -> int:
             return 1
         return 0
 
-    OUT_H.write_text(header, encoding="utf-8")
-    OUT_CPP.write_text(cpp, encoding="utf-8")
+    OUT_H.write_bytes(header.encode("utf-8"))
+    OUT_CPP.write_bytes(cpp.encode("utf-8"))
     print(f"generated {OUT_H.relative_to(ROOT)} and {OUT_CPP.relative_to(ROOT)}")
     return 0
 
