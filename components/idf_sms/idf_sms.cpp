@@ -650,7 +650,7 @@ static bool decode_pdu_line(const std::string& line)
     DecodedSms decoded;
     if (!s_pdu.decodePDU(line.c_str())) {
         xSemaphoreGive(s_pdu_mutex);
-        idf_log_line("PDU 解析失败");
+        idf_logf("PDU 解析失败(hex=%u)", static_cast<unsigned>(line.size()));
         return false;
     }
     decoded.sender = s_pdu.getSender();
@@ -780,6 +780,9 @@ static void process_urc_line(const std::string& raw)
             // 窗口内又来一条 +CMT：前一条的 PDU 已丢(直推短信不落存储无从兜底)，
             // 重臂窗口至少保住新的这条，并记一笔便于排查
             idf_log_line("等待直推 PDU 时又收到 +CMT，前一条可能丢失");
+            size_t comma = line.rfind(',');
+            idf_logf("收到直推短信头，TPDU 长度=%d",
+                     comma == std::string::npos ? -1 : atoi(line.c_str() + comma + 1));
             s_wait_pdu_until_us = esp_timer_get_time() + 3LL * 1000LL * 1000LL;
             return;
         }
@@ -809,6 +812,9 @@ static void process_urc_line(const std::string& raw)
     }
 
     if (starts_with(line, "+CMT:")) {
+        size_t comma = line.rfind(',');
+        idf_logf("收到直推短信头，TPDU 长度=%d",
+                 comma == std::string::npos ? -1 : atoi(line.c_str() + comma + 1));
         s_wait_pdu = true;
         s_wait_pdu_until_us = esp_timer_get_time() + 3LL * 1000LL * 1000LL;  // 3s 窗口
     } else if (starts_with(line, "+CMTI:")) {

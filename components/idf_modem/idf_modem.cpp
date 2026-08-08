@@ -57,6 +57,11 @@ static QueueHandle_t s_uart_evt_queue = nullptr;
 static SemaphoreHandle_t s_event_sem = nullptr;
 static IdfModemStatus s_status;
 static std::string s_urc_buffer;
+// 普通 AT 响应与异步 URC 共用 UART。按行持续提取短信/来电 URC，避免 +CMT 头和
+// 后续 PDU 落在两个读取周期时，PDU 被误吞进下一条 AT 响应。
+static std::string s_uart_line_carry;
+static bool s_uart_wait_cmt_pdu = false;
+static int64_t s_uart_wait_cmt_until_us = 0;
 static bool s_started = false;
 static std::atomic<int> s_reset_request{0};  // 1=AT软重启，2=EN硬重启；由模组任务执行
 static bool s_data_mode_retry_pending = false;
@@ -92,6 +97,9 @@ static void cleanup_start_resources()
         s_event_sem = nullptr;
     }
     s_urc_buffer.clear();
+    s_uart_line_carry.clear();
+    s_uart_wait_cmt_pdu = false;
+    s_uart_wait_cmt_until_us = 0;
 }
 
 static bool parse_long_token(const std::string& value, long& out)
@@ -440,6 +448,49 @@ static void append_urc_text(const std::string& text)
 
 static void append_capped(std::string& out, const uint8_t* data, size_t len, size_t cap);
 
+static bool looks_like_pdu_line(const std::string& line)
+{
+    if (line.size() < 32 || (line.size() & 1) != 0) return false;
+    return std::all_of(line.begin(), line.end(), [](unsigned char ch) { return isxdigit(ch); });
+}
+
+static void preserve_uart_urc_line(const std::string& raw)
+{
+    std::string line = idf_util_trim_copy(raw);
+    if (line.empty()) return;
+    if (s_uart_wait_cmt_pdu && esp_timer_get_time() > s_uart_wait_cmt_until_us) {
+        s_uart_wait_cmt_pdu = false;
+    }
+
+    bool cmt = line.rfind("+CMT:", 0) == 0;
+    bool standalone = line.rfind("+CMTI:", 0) == 0 || line.rfind("+CLIP:", 0) == 0 || line == "RING";
+    if (cmt || standalone || (s_uart_wait_cmt_pdu && looks_like_pdu_line(line))) {
+        append_urc_text(line + "\r\n");
+    }
+    if (cmt) {
+        s_uart_wait_cmt_pdu = true;
+        s_uart_wait_cmt_until_us = esp_timer_get_time() + 3LL * 1000LL * 1000LL;
+    } else if (s_uart_wait_cmt_pdu && looks_like_pdu_line(line)) {
+        s_uart_wait_cmt_pdu = false;
+    }
+}
+
+static void preserve_uart_urcs(const uint8_t* data, size_t len)
+{
+    for (size_t i = 0; i < len; ++i) {
+        char ch = static_cast<char>(data[i]);
+        if (ch == '\r' || ch == '\n') {
+            if (!s_uart_line_carry.empty()) preserve_uart_urc_line(s_uart_line_carry);
+            s_uart_line_carry.clear();
+        } else if (s_uart_line_carry.size() < 768) {
+            s_uart_line_carry += ch;
+        } else {
+            s_uart_line_carry.clear();
+            s_uart_wait_cmt_pdu = false;
+        }
+    }
+}
+
 static void capture_pending_uart_locked(uint32_t max_ms)
 {
     // RX 缓冲为空时立即返回：该函数在每条 AT 命令前都会执行，
@@ -447,23 +498,19 @@ static void capture_pending_uart_locked(uint32_t max_ms)
     size_t buffered = 0;
     if (uart_get_buffered_data_len(MODEM_UART, &buffered) == ESP_OK && buffered == 0) return;
 
-    std::string pending;
-    pending.reserve(256);
     uint8_t buf[128];
     // 静默窗口(有数据就续期)之上必须再加总时长硬上限：模组连续吐数据
     // (下载中途中止的 MHTTP 载荷、复位横幅、错误波特率乱码)时，纯续期
-    // 循环永不退出，pending 无限增长直至堆耗尽。URC 缓冲本身只留固定上限尾部，
-    // 这里同样只保留尾部即可，多攒毫无意义。
+    // 循环会长期占住 AT 通道；按行提取器本身已有固定长度上限，不在这里重复缓存。
     TickDeadline hard_deadline(std::max<uint32_t>(max_ms, 1000));
     TickDeadline quiet(max_ms);
     do {
         int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(20));
         if (got > 0) {
-            append_capped(pending, buf, static_cast<size_t>(got), URC_BUFFER_MAX);
+            preserve_uart_urcs(buf, static_cast<size_t>(got));
             quiet.restart(40);
         }
     } while (!quiet.expired() && !hard_deadline.expired());
-    if (!pending.empty()) append_urc_text(pending);
 }
 
 // 返回是否成功抢到 AT 通道锁并完成抓取；false=通道正被长任务占用
@@ -474,6 +521,19 @@ static bool poll_unsolicited_uart(uint32_t max_ms)
     capture_pending_uart_locked(max_ms);
     xSemaphoreGiveRecursive(s_at_mutex);
     return true;
+}
+
+static void handle_uart_event_error(const uart_event_t& evt)
+{
+    if (evt.type == UART_FIFO_OVF || evt.type == UART_BUFFER_FULL) {
+        idf_log_line(evt.type == UART_FIFO_OVF
+                         ? "模组 UART 硬件 FIFO 溢出，本次接收数据可能不完整"
+                         : "模组 UART 接收缓冲已满，本次接收数据可能不完整");
+    } else if (evt.type == UART_PARITY_ERR) {
+        idf_log_line("模组 UART 奇偶校验错误，本次接收数据可能损坏");
+    } else if (evt.type == UART_FRAME_ERR) {
+        idf_log_line("模组 UART 帧错误，本次接收数据可能损坏");
+    }
 }
 
 static bool at_channel_idle_now(void)
@@ -495,17 +555,6 @@ static void append_capped(std::string& out, const uint8_t* data, size_t len, siz
     size_t need = out.size() + len;
     if (need > cap) out.erase(0, need - cap);
     out.append(reinterpret_cast<const char*>(data), len);
-}
-
-static void preserve_sms_urc_from_response(const std::string& response)
-{
-    if (response.find("+CMT:") != std::string::npos ||
-        response.find("+CMTI:") != std::string::npos ||
-        response.find("+CLIP:") != std::string::npos ||
-        response.find("RING") != std::string::npos) {
-        // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
-        append_urc_text(response);
-    }
 }
 
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
@@ -530,6 +579,7 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
     while (!deadline.expired()) {
         int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(80));
         if (got > 0) {
+            preserve_uart_urcs(buf, static_cast<size_t>(got));
             size_t room = MAX_RESPONSE > response.size() ? MAX_RESPONSE - response.size() : 0;
             if (room > 0) response.append(reinterpret_cast<const char*>(buf), std::min<size_t>(room, got));
             scan.append(reinterpret_cast<const char*>(buf), got);
@@ -541,7 +591,6 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
             if (scan.size() > 32) scan.erase(0, scan.size() - 32);
         }
     }
-    preserve_sms_urc_from_response(response);
     xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
@@ -566,6 +615,7 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
     while (!deadline.expired()) {
         int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(100));
         if (got > 0) {
+            preserve_uart_urcs(buf, static_cast<size_t>(got));
             append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
             scan.append(reinterpret_cast<const char*>(buf), got);
             if (response.find(token) != std::string::npos || scan.find(token) != std::string::npos) {
@@ -579,7 +629,6 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
             if (scan.size() > 64) scan.erase(0, scan.size() - 64);
         }
     }
-    preserve_sms_urc_from_response(response);
     xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
@@ -605,6 +654,7 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
     while (!prompt_deadline.expired()) {
         int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(80));
         if (got > 0) {
+            preserve_uart_urcs(buf, static_cast<size_t>(got));
             append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
             scan.append(reinterpret_cast<const char*>(buf), got);
             if (response.find('>') != std::string::npos || scan.find('>') != std::string::npos) {
@@ -633,6 +683,7 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         while (!deadline.expired()) {
             int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
             if (got > 0) {
+                preserve_uart_urcs(buf, static_cast<size_t>(got));
                 append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
                 scan.append(reinterpret_cast<const char*>(buf), got);
                 // 官方手册定义 +CMGS:<mr> 即网络已接受 SMS-SUBMIT；某些固件的尾随 OK
@@ -651,7 +702,6 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         }
     }
 
-    preserve_sms_urc_from_response(response);
     xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
@@ -1054,6 +1104,7 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
     while (!deadline.expired()) {
         int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(80));
         if (got > 0) {
+            preserve_uart_urcs(buf, static_cast<size_t>(got));
             size_t room = max_capture > response.size() ? max_capture - response.size() : 0;
             if (room > 0) response.append(reinterpret_cast<const char*>(buf), std::min<size_t>(room, got));
             int final_code = at_final_result(response);
@@ -1066,6 +1117,7 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
                 while (!extra_deadline.expired() && !extra_hard.expired()) {
                     int more = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(15));
                     if (more <= 0) continue;
+                    preserve_uart_urcs(buf, static_cast<size_t>(more));
                     room = max_capture > response.size() ? max_capture - response.size() : 0;
                     if (room > 0) response.append(reinterpret_cast<const char*>(buf), std::min<size_t>(room, more));
                     extra_deadline.restart(extra_read_ms);
@@ -1074,7 +1126,6 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
             }
         }
     }
-    preserve_sms_urc_from_response(response);
     return ret;
 }
 
@@ -2388,7 +2439,9 @@ static void modem_task(void*)
             uart_event_t evt;
             if (s_uart_evt_queue) {
                 if (xQueueReceive(s_uart_evt_queue, &evt, pdMS_TO_TICKS(500)) == pdTRUE) {
-                    while (xQueueReceive(s_uart_evt_queue, &evt, 0) == pdTRUE) {}  // 合并积压事件
+                    do {
+                        handle_uart_event_error(evt);
+                    } while (xQueueReceive(s_uart_evt_queue, &evt, 0) == pdTRUE);
                 }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(500));
