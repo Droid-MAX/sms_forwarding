@@ -1928,6 +1928,9 @@ static bool configure_sms_and_registration(void)
 {
     send_ok("ATE0", 1000);
     send_ok("AT+CMEE=1", 1200);  // 明确返回 +CMS/+CME 数字错误，避免只有笼统 ERROR
+    // 直推 +CMT 使用 Phase 2+ 确认流程；收到每个 PDU 后由短信任务发送 AT+CNMA=0。
+    // ML307R 手册明确指出可靠的 TA-TE 短信传输需要 +CNMA，否则连续长短信可能只上报一段。
+    bool phase2_ok = send_ok("AT+CSMS=1", 1200);
     bool pdu_mode_ok = send_ok("AT+CMGF=0", 1200);
     // 统一补收路径的短信存储位置：特殊类别/启动期落盘后，+CMTI 与 CMGL/CMGR
     // 必须查看同一存储，否则兜底索引会指向另一块存储。
@@ -1943,7 +1946,7 @@ static bool configure_sms_and_registration(void)
     // NET 指示灯开关(ML307R: AT+MLED=0,<0/1>)：每次初始化按保存的配置下发，
     // 覆盖模组记住的上次状态
     send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
-    bool sms_ready = pdu_mode_ok && storage_ok && cnmi_ok;
+    bool sms_ready = phase2_ok && pdu_mode_ok && storage_ok && cnmi_ok;
     if (!sms_ready) idf_log_line("短信收发配置未完整生效，将在后续健康检查中重试");
     return sms_ready;
 }
@@ -1956,9 +1959,10 @@ static bool response_has_compact(std::string response, const char* expected)
     return response.find(expected) != std::string::npos;
 }
 
-static void query_sms_receive_config(bool& pdu, bool& cnmi)
+static void query_sms_receive_config(bool& phase2, bool& pdu, bool& cnmi)
 {
     std::string resp;
+    phase2 = send_ok("AT+CSMS?", 1200, &resp) && response_has_compact(resp, "+CSMS:1,");
     pdu = send_ok("AT+CMGF?", 1200, &resp) && response_has_compact(resp, "+CMGF:0");
     cnmi = send_ok("AT+CNMI?", 1200, &resp) &&
            response_has_compact(resp, "+CNMI:2,2,0,0,0");
@@ -1978,26 +1982,28 @@ bool idf_modem_sms_health_check(std::string& summary)
     int stat = -1;
     bool registered = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat) &&
                       (stat == 1 || stat == 5);
+    bool phase2 = false;
     bool pdu = false;
     bool cnmi = false;
-    query_sms_receive_config(pdu, cnmi);
+    query_sms_receive_config(phase2, pdu, cnmi);
     bool storage = select_sms_storage();
-    bool initially_ok = registered && pdu && cnmi && storage;
+    bool initially_ok = registered && phase2 && pdu && cnmi && storage;
 
-    if (!pdu || !cnmi || !storage) {
+    if (!phase2 || !pdu || !cnmi || !storage) {
         configure_sms_and_registration();
         stat = -1;
         registered = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat) &&
                      (stat == 1 || stat == 5);
-        query_sms_receive_config(pdu, cnmi);
+        query_sms_receive_config(phase2, pdu, cnmi);
         storage = select_sms_storage();
     }
 
-    bool final_ok = registered && pdu && cnmi && storage;
-    char state[160];
-    snprintf(state, sizeof(state), "注册=%s，PDU=%s，CNMI=%s，存储=%s（不含运营商端到端投递）",
-             registered ? "正常" : "异常", pdu ? "正常" : "异常", cnmi ? "正常" : "异常",
-             storage ? "正常" : "异常");
+    bool final_ok = registered && phase2 && pdu && cnmi && storage;
+    char state[192];
+    snprintf(state, sizeof(state),
+             "注册=%s，Phase2+=%s，PDU=%s，CNMI=%s，存储=%s（不含运营商端到端投递）",
+             registered ? "正常" : "异常", phase2 ? "正常" : "异常", pdu ? "正常" : "异常",
+             cnmi ? "正常" : "异常", storage ? "正常" : "异常");
 
     if (initially_ok) {
         summary = std::string("正常：") + state;

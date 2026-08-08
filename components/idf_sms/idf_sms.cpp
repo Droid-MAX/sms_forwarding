@@ -52,6 +52,7 @@ static constexpr uint32_t SMS_SUBMIT_TIMEOUT_MS = 60000;
 struct ConcatPart {
     bool valid = false;
     std::string text;
+    std::string timestamp;
 };
 
 struct ConcatSlot {
@@ -96,6 +97,7 @@ static std::string s_urc_carry;
 static bool s_wait_pdu = false;
 static int64_t s_wait_pdu_until_us = 0;   // +CMT 后等 PDU 行的窗口截止(3s，对齐 Arduino)
 static bool s_backfill_pending = false;   // 索引队列溢出/CMGR 失败时，请求一次近期 CMGL 兜底
+static bool s_cnma_error_logged = false;  // 避免异常固件每条直推短信都刷同一条确认失败日志
 static std::atomic<bool> s_admin_sms_busy{false};
 static std::atomic<bool> s_admin_reset_pending{false};
 
@@ -429,6 +431,7 @@ static void clear_concat_slot(ConcatSlot& slot)
     for (auto& part : slot.parts) {
         part.valid = false;
         part.text.clear();
+        part.timestamp.clear();
     }
 }
 
@@ -460,6 +463,7 @@ struct ConcatDone {
     int total = 0;
     std::string sender;
     std::array<uint32_t, CONCAT_PARTS> partHash = {};
+    std::array<std::string, CONCAT_PARTS> partTimestamp;
     int64_t doneUs = 0;
 };
 static constexpr int64_t CONCAT_DONE_TTL_US = 10LL * 60 * 1000 * 1000;
@@ -467,13 +471,13 @@ static std::array<ConcatDone, 4> s_concat_done = {};
 static size_t s_concat_done_next = 0;
 
 static bool concat_recently_done(int ref, const std::string& sender, int total,
-                                 int part, const std::string& text)
+                                 int part, const std::string& text, const std::string& timestamp)
 {
     int64_t now = esp_timer_get_time();
     for (const auto& d : s_concat_done) {
         if (!d.used || now - d.doneUs > CONCAT_DONE_TTL_US) continue;
         if (d.ref == ref && d.total == total && d.sender == sender &&
-            d.partHash[part - 1] == hash32(text)) {
+            d.partHash[part - 1] == hash32(text) && d.partTimestamp[part - 1] == timestamp) {
             return true;
         }
     }
@@ -489,8 +493,12 @@ static void record_concat_done(const ConcatSlot& slot)
     d.total = slot.total;
     d.sender = slot.sender;
     d.partHash.fill(0);
+    for (auto& timestamp : d.partTimestamp) timestamp.clear();
     for (int i = 0; i < slot.total && i < static_cast<int>(CONCAT_PARTS); ++i) {
-        if (slot.parts[i].valid) d.partHash[i] = hash32(slot.parts[i].text);
+        if (slot.parts[i].valid) {
+            d.partHash[i] = hash32(slot.parts[i].text);
+            d.partTimestamp[i] = slot.parts[i].timestamp;
+        }
     }
     d.doneUs = esp_timer_get_time();
 }
@@ -588,15 +596,28 @@ static void handle_decoded_pdu(const DecodedSms& sms)
             process_sms_content(sender, text, ts);
             return;
         }
-        if (concat_recently_done(ref, sender ? sender : "", total, part, text ? text : "")) {
+        if (concat_recently_done(ref, sender ? sender : "", total, part,
+                                 text ? text : "", ts ? ts : "")) {
             idf_logf("长短信分段 ref=%d %d/%d 与近期已合并消息重复，忽略", ref, part, total);
             return;
         }
         ConcatSlot& slot = find_concat_slot(ref, sender ? sender : "", total);
         int idx = part - 1;
+        if (slot.parts[idx].valid && slot.parts[idx].text != (text ? text : "")) {
+            // 8 位引用号可能被运营商快速复用；同一分段号正文已变化时不能继续混拼旧消息。
+            idf_logf("长短信引用号 ref=%d 已复用，丢弃旧的不完整 %d/%d 段并重新归组",
+                     ref, slot.received, slot.total);
+            clear_concat_slot(slot);
+            slot.active = true;
+            slot.ref = ref;
+            slot.total = total;
+            slot.sender = sender ? sender : "";
+            slot.lastUs = esp_timer_get_time();
+        }
         if (!slot.parts[idx].valid) {
             slot.parts[idx].valid = true;
             slot.parts[idx].text = text ? text : "";
+            slot.parts[idx].timestamp = ts ? ts : "";
             slot.received++;
             slot.lastUs = esp_timer_get_time();
             if (slot.timestamp.empty()) slot.timestamp = ts ? ts : "";
@@ -768,6 +789,15 @@ static void process_urc_line(const std::string& raw)
         }
         if (decode_pdu_line(line)) {
             s_wait_pdu = false;
+            // ML307R 的 +CNMI 文档要求直推短信通过 +CNMA 确认，确认后模组才会可靠地
+            // 继续上报同一条长短信的后续分段。存储读取(CMGR/CMGL)不走此分支。
+            std::string ack_resp;
+            if (idf_modem_send_at("AT+CNMA=0", 1500, ack_resp) == ESP_OK) {
+                s_cnma_error_logged = false;
+            } else if (!s_cnma_error_logged) {
+                s_cnma_error_logged = true;
+                idf_log_line("直推短信确认失败，后续分段可能由 SIM 存储轮询补收");
+            }
             return;
         }
         if (line != "OK" && line != "ERROR") {
@@ -989,7 +1019,7 @@ static void sms_task(void*)
     uint64_t last_poll_ms = 0;  // 64 位毫秒：32 位在 49.7 天回绕会重进启动提频窗口
     uint64_t start_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     uint32_t poll_count = 0;
-    uint8_t reassert_step = 0;  // 1=CMGF, 2=CPMS, 3=CNMI；拆帧避免一次堆多条 AT
+    uint8_t reassert_step = 0;  // 1=CSMS, 2=CMGF, 3=CPMS, 4=CNMI；拆帧避免一次堆多条 AT
     bool backfill_after_reassert = false;
     bool configured = false;
     bool first_backfill = true;
@@ -1010,6 +1040,7 @@ static void sms_task(void*)
         IdfModemStatus modem = idf_modem_get_status();
         if (modem.atReady && !configured) {
             std::string ignored;
+            idf_modem_send_at("AT+CSMS=1", 1200, ignored);
             idf_modem_send_at("AT+CMGF=0", 1200, ignored);
             idf_modem_send_at("AT+CNMI=2,2,0,0,0", 1200, ignored);
             configured = true;
@@ -1021,13 +1052,16 @@ static void sms_task(void*)
             if (reassert_step != 0) {
                 std::string ignored;
                 if (reassert_step == 1) {
-                    idf_modem_send_at("AT+CMGF=0", 1200, ignored);
+                    idf_modem_send_at("AT+CSMS=1", 1200, ignored);
                     reassert_step = 2;
                 } else if (reassert_step == 2) {
+                    idf_modem_send_at("AT+CMGF=0", 1200, ignored);
+                    reassert_step = 3;
+                } else if (reassert_step == 3) {
                     // CPMS 也要重申：模组自发复位后存储会回落固件默认，
                     // SM 容量为 0 的 eSIM 上接收会静默死亡(只 CMGF/CNMI 救不回来)
                     idf_modem_reassert_sms_storage();
-                    reassert_step = 3;
+                    reassert_step = 4;
                 } else {
                     idf_modem_send_at("AT+CNMI=2,2,0,0,0", 1200, ignored);
                     reassert_step = 0;
