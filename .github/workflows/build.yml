@@ -20,7 +20,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: espressif/idf:release-v5.5
+    container: espressif/idf:v6.0.2
 
     steps:
       - name: Checkout repository
@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
-          idf.py -B build/idf -D SDKCONFIG=build/sdkconfig build
+          idf.py -B build/idf6 -D SDKCONFIG=build/sdkconfig.idf6 build
 
       - name: Package release binaries
         shell: bash
@@ -51,12 +51,12 @@ jobs:
           V=${{ steps.version.outputs.version }}
           mkdir -p dist
           # OTA 升级包：网页"固件升级"直接上传这个（仅 app 分区镜像）
-          cp build/idf/sms_forwarding_idf.bin "dist/sms_forwarder_ota_v${V}.bin"
+          cp build/idf6/sms_forwarding_idf.bin "dist/sms_forwarder_ota_v${V}.bin"
           # 整机烧录包：bootloader+分区表+app 合并为单文件，esptool 从 0x0 烧录即可
-          esptool.py --chip esp32c3 merge_bin -o "dist/sms_forwarder_full_v${V}.bin" \
-            0x0 build/idf/bootloader/bootloader.bin \
-            0x8000 build/idf/partition_table/partition-table.bin \
-            0x10000 build/idf/sms_forwarding_idf.bin
+          esptool --chip esp32c3 merge-bin -o "dist/sms_forwarder_full_v${V}.bin" \
+            0x0 build/idf6/bootloader/bootloader.bin \
+            0x8000 build/idf6/partition_table/partition-table.bin \
+            0x10000 build/idf6/sms_forwarding_idf.bin
           ls -l dist/
 
       - name: Upload firmware artifact (7-day retention)
@@ -65,9 +65,9 @@ jobs:
           name: esp-idf-firmware-bin
           path: |
             dist/*.bin
-            build/idf/sms_forwarding_idf.bin
-            build/idf/bootloader/bootloader.bin
-            build/idf/partition_table/partition-table.bin
+            build/idf6/sms_forwarding_idf.bin
+            build/idf6/bootloader/bootloader.bin
+            build/idf6/partition_table/partition-table.bin
           retention-days: 7
 
       # 推送到 master 时自动发布/更新 Release：tag 为 v<版本号>，附可直接下载的固件。
@@ -95,7 +95,7 @@ jobs:
             已经安装 Python/esptool 的高级用户，也可以用命令行刷完整包（按实际串口号替换 `COM5`）：
 
             ```powershell
-            esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v${{ steps.version.outputs.version }}.bin
+            esptool --chip esp32c3 -p COM5 -b 460800 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 4MB 0x0 sms_forwarder_full_v${{ steps.version.outputs.version }}.bin
             ```
 
             OTA 升级：打开设备网页的「固件升级」页，上传 `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin`。不要把 `full` 包上传到网页 OTA，也不要把 `ota` 包从 `0x0` 当整机镜像刷写。

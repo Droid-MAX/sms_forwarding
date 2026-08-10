@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.22.1)
 
 # 原生 ESP-IDF 固件工程入口；Arduino fallback 已移除。
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

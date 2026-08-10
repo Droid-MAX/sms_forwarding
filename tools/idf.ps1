@@ -11,11 +11,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$BuildDir = Join-Path $RepoRoot 'build\idf'
-$SdkConfig = Join-Path $RepoRoot 'build\sdkconfig'
+$BuildDir = Join-Path $RepoRoot 'build\idf6'
+$SdkConfig = Join-Path $RepoRoot 'build\sdkconfig.idf6'
 
 if ([string]::IsNullOrWhiteSpace($IdfPath)) {
-    $IdfPath = 'E:\Espressif\esp-idf-v5.5.4'
+    $IdfPath = 'E:\Espressif\esp-idf-v6.0.2'
 }
 if ([string]::IsNullOrWhiteSpace($IdfToolsPath)) {
     $IdfToolsPath = 'E:\Espressif\.espressif'
