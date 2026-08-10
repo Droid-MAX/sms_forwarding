@@ -106,7 +106,7 @@ Web UI 提供独立的定时任务页，既能做 SIM 保号，也能做系统�
 
 ### 原生 ESP-IDF 固件
 
-- 基于 ESP-IDF 5.x，目标芯片为 ESP32-C3。
+- 基于 ESP-IDF 6.0.2，目标芯片为 ESP32-C3。
 - 使用组件化结构拆分配置、WiFi、Web、模组、短信、推送、日志和收件箱。
 - 通过 CI 持续构建，减少“本地能编过、换环境不行”的问题。
 - Web UI 使用 `code/web_src/` 维护源码，再打包为 gzip 静态资源链接进固件。
@@ -196,13 +196,13 @@ Web 侧数据流：
 | `smsdata` | 640KB | 短信、收件箱等本地数据，使用 NVS 磨损均衡与掉电原子写入 |
 | `coredump` | 64KB | 崩溃转储，便于定位无人值守设备的异常 |
 
-`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MB。当前固件大小约 1.24MB，单槽仍有约 24% 余量，可继续容纳后续 eSIM、诊断和 UI 功能。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
+`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MiB。ESP-IDF 6.0.2 构建的当前固件约 1.22MiB，单槽剩余约 25%（约 417KiB），可继续容纳后续 eSIM、诊断和 UI 功能。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
 
 ## 体积与内存优化
 
 - 编译使用 `-Os` 尺寸优化，并减少断言字符串带来的 rodata 占用。
 - 关闭项目不使用的 IPv6、termios、WiFi NVS 等能力，减少 flash 和 RAM 占用。
-- WiFi 收发路径、FreeRTOS 与 ringbuf 部分函数放回 flash，释放 ESP32-C3 紧张的 IRAM。
+- WiFi 收发路径放回 flash；FreeRTOS 与 ring buffer 沿用 IDF 6 的默认 flash 放置行为，释放 ESP32-C3 紧张的 IRAM。
 - TLS 使用动态缓冲和会话后释放策略，空闲期减少堆占用。
 - socket 上限提高到 20，适配多浏览器标签页、mDNS、SNTP、推送和 SMTP 并存的场景。
 - SNTP 配置主服务器和兜底服务器，单个 NTP 不可达时不影响时间同步。
@@ -267,10 +267,10 @@ start preview\index.html
 已经安装 Python/esptool 的用户，也可以直接用命令行刷完整包：
 
 ```powershell
-esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v*.bin
+esptool --chip esp32c3 -p COM5 -b 460800 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size 4MB 0x0 sms_forwarder_full_v*.bin
 ```
 
-其中 `COM5` 和文件名按实际情况替换。`esptool.py` 是电脑端刷写工具，不在固件里；没有 Python 环境时请优先使用上面的 GUI 工具。
+其中 `COM5` 和文件名按实际情况替换。`esptool` 是电脑端刷写工具，不在固件里；没有 Python 环境时请优先使用上面的 GUI 工具。
 
 ### 后续 OTA 升级
 
@@ -298,7 +298,7 @@ esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_
 - ESP32-C3 开发板或 ESP32-C3 Super Mini。
 - ML307 系列 4G/LTE 模组。
 - USB 数据线和对应串口驱动。
-- ESP-IDF 5.5.4。仓库脚本默认查找 `E:\Espressif\esp-idf-v5.5.4`，也可以通过 `IDF_PATH` 和 `IDF_TOOLS_PATH` 环境变量指定自己的安装位置。
+- ESP-IDF 6.0.2。仓库脚本默认查找 `E:\Espressif\esp-idf-v6.0.2`，也可以通过 `IDF_PATH` 和 `IDF_TOOLS_PATH` 环境变量指定自己的安装位置。
 
 确认串口号：
 
@@ -313,7 +313,7 @@ git clone https://github.com/MineSunshineone/sms_forwarding.git
 cd sms_forwarding
 ```
 
-仓库提供了 ESP-IDF 封装脚本，会自动加载 ESP-IDF 环境，并把构建产物放在 `build/idf`，把 `sdkconfig` 放在 `build/sdkconfig`：
+仓库提供了 ESP-IDF 封装脚本，会自动加载 ESP-IDF 环境，并把构建产物放在 `build/idf6`，把配置放在 `build/sdkconfig.idf6`：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build
@@ -340,7 +340,7 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 
 `monitor` 中可以看到 WiFi 连接、模组初始化、短信接收、推送、Web 访问和崩溃原因等日志。退出 monitor 通常使用 `Ctrl+]`。
 
-CI 使用 `.github/workflows/build.yml` 构建 ESP-IDF 固件，日常本地开发建议仍使用 `tools\idf.ps1`，这样构建目录和配置文件位置保持一致。
+CI 使用固定的 ESP-IDF 6.0.2 环境，通过 `.github/workflows/build.yml` 构建固件；日常本地开发建议仍使用 `tools\idf.ps1`，这样 SDK 版本、构建目录和配置文件位置保持一致。
 
 ## Bark 推送
 
