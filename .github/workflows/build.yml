@@ -7,6 +7,7 @@ on:
       - 'components/**'
       - 'code/web_src/**'
       - 'tools/**'
+      - 'patches/**'
       - 'CMakeLists.txt'
       - 'sdkconfig.defaults'
       - 'partitions_ota_1m6.csv'
@@ -24,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Verify generated web assets
         run: python tools/build_web_assets.py --check
@@ -42,6 +43,7 @@ jobs:
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
+          python tools/apply_idf_patches.py --idf-path "$IDF_PATH"
           idf.py -B build/idf6 -D SDKCONFIG=build/sdkconfig.idf6 build
 
       - name: Package release binaries
@@ -74,7 +76,7 @@ jobs:
       # 同版本再次推送会更新既有 Release 的附件（覆盖同名文件），不会重复建 Release。
       - name: Publish GitHub Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: 固件 v${{ steps.version.outputs.version }}

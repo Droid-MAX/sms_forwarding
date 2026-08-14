@@ -268,6 +268,28 @@ static bool is_imei_text(const std::string& value)
     return true;
 }
 
+static std::string parse_imei_response(const std::string& resp)
+{
+    size_t pos = 0;
+    while (pos < resp.size()) {
+        size_t end = resp.find('\n', pos);
+        if (end == std::string::npos) end = resp.size();
+        std::string line = idf_util_trim_copy(resp.substr(pos, end - pos));
+        std::string candidate;
+        if (line.rfind("+CGSN:", 0) == 0 || line.rfind("+GSN:", 0) == 0) {
+            candidate = idf_util_trim_copy(line.substr(line.find(':') + 1));
+            if (candidate.size() >= 2U && candidate.front() == '"' && candidate.back() == '"') {
+                candidate = candidate.substr(1, candidate.size() - 2U);
+            }
+        } else if (is_imei_text(line)) {
+            candidate = line;
+        }
+        if (is_imei_text(candidate)) return candidate;
+        pos = end + 1U;
+    }
+    return {};
+}
+
 static bool is_imsi_text(const std::string& value)
 {
     if (value.size() < 14 || value.size() > 16) return false;
@@ -720,6 +742,19 @@ static bool send_ok(const char* cmd, uint32_t timeout_ms = 1000, std::string* ou
     esp_err_t err = idf_modem_send_at(cmd, timeout_ms, resp);
     if (out) *out = resp;
     return err == ESP_OK;
+}
+
+static std::string query_imei_from_modem(void)
+{
+    // ML307R 的裸 AT+CGSN 可能返回模组序列号；只有带参数的标准 IMEI 查询才作为候选。
+    static constexpr const char* kCommands[] = {"AT+CGSN=1", "AT+GSN=1"};
+    for (const char* command : kCommands) {
+        std::string response;
+        if (!send_ok(command, 1000, &response)) continue;
+        std::string imei = parse_imei_response(response);
+        if (!imei.empty()) return imei;
+    }
+    return {};
 }
 
 static std::string parse_iccid_response(const std::string& raw)
@@ -1756,15 +1791,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     }
 
     if (before.imei.size() < 14) {
-        const char* imei_cmds[] = {"AT+CGSN=1", "AT+GSN=1", "AT+CGSN", "AT+GSN"};
-        for (const char* cmd : imei_cmds) {
-            if (!patch.imei.empty()) break;
-            if (send_ok(cmd, 1000, &resp)) {
-                patch.imei = first_digits_line(resp, 14, 17);
-                if (patch.imei.empty()) patch.imei = first_digit_run(resp, 14, 17);
-            }
-            vTaskDelay(pdMS_TO_TICKS(80));
-        }
+        patch.imei = query_imei_from_modem();
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
@@ -2541,6 +2568,29 @@ IdfModemStatus idf_modem_get_status(void)
         xSemaphoreGive(s_status_mutex);
     }
     return copy;
+}
+
+esp_err_t idf_modem_get_imei(std::string& imei)
+{
+    imei.clear();
+    IdfModemStatus status = idf_modem_get_status();
+    if (is_imei_text(status.imei)) {
+        imei = status.imei;
+        return ESP_OK;
+    }
+    if (!s_started || !s_at_mutex) return ESP_ERR_INVALID_STATE;
+
+    imei = query_imei_from_modem();
+    if (!is_imei_text(imei)) {
+        imei.clear();
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    IdfModemStatus patch;
+    patch.imei = imei;
+    update_status(patch, false, false);
+    save_identity_cache(imei, std::string());
+    return ESP_OK;
 }
 
 esp_err_t idf_modem_request_reset(bool hard_reset)

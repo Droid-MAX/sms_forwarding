@@ -31,6 +31,9 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 $env:IDF_TOOLS_PATH = $IdfToolsPath
 . $ExportScript
 
+# 在外部 ESP-IDF 源码上应用项目维护的兼容 patch；由 git apply 严格检查上下文。
+python (Join-Path $RepoRoot 'tools\apply_idf_patches.py') --idf-path $IdfPath
+
 $IdfArgs = @('-B', $BuildDir, '-D', "SDKCONFIG=$SdkConfig")
 
 switch ($Action) {

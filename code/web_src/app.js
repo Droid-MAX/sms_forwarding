@@ -1592,7 +1592,46 @@
       btn.onclick = function(){ esimRun(action, id, nick); };
       return btn;
     }
+    function esimRenderInstall(d) {
+      var host = document.getElementById('esimInstallHost');
+      var matching = document.getElementById('esimInstallMatchingId');
+      var status = document.getElementById('esimInstallStatus');
+      var start = document.getElementById('esimInstallStartBtn');
+      var confirmationBox = document.getElementById('esimConfirmationBox');
+      var confirmationInput = document.getElementById('esimConfirmationCode');
+      var confirmationSubmit = document.getElementById('esimConfirmationSubmitBtn');
+      if (!host || !matching || !status || !start) return;
+      host.textContent = d.installHost || '--';
+      matching.textContent = d.installMatchingIdMasked || '--';
+      var busy = !!(d.jobQueued || d.jobRunning);
+      var active = busy && d.action === 'install-start';
+      var waitingConfirmation = active && d.installPhase === 'waiting_confirmation';
+      start.disabled = busy;
+      if (confirmationBox && confirmationInput && confirmationSubmit) {
+        confirmationBox.style.display = waitingConfirmation ? '' : 'none';
+        if (!waitingConfirmation) confirmationInput.value = '';
+        confirmationSubmit.disabled = !waitingConfirmation || !confirmationInput.value.trim();
+        confirmationInput.oninput = function() {
+          confirmationSubmit.disabled = !this.value.trim();
+        };
+      }
+      if (d.action === 'install-start' && d.jobMessage) {
+        status.className = 'result-box ' + (active ? 'result-loading' : (d.jobSuccess ? 'result-success' : 'result-error'));
+        status.textContent = d.jobMessage;
+      } else if (busy) {
+        status.className = 'result-box result-loading';
+        status.textContent = d.jobMessage || '其它 eSIM 任务执行中';
+      } else if (!busy && (!d.action || d.action !== 'install-start')) {
+        status.className = 'result-box result-info';
+        status.textContent = '尚未提交下载任务';
+      }
+      if (!busy && d.action !== 'install-start') {
+        host.textContent = '--';
+        matching.textContent = '--';
+      }
+    }
     function esimRender(d) {
+      esimRenderInstall(d);
       var el = document.getElementById('esimEid'); if (el) el.textContent = d.eid || '未读取';
       el = document.getElementById('esimCount'); if (el) el.textContent = '共 ' + String(d.profileCount == null ? 0 : d.profileCount) + ' 个';
       el = document.getElementById('esimUpdated'); if (el) el.textContent = d.updatedLocal || '--';
@@ -1668,6 +1707,56 @@
         if (d.success && d.queued) { showToast(d.message || 'eSIM 任务已排队', 'loading'); esimLoadStatus(true); }
         else { showToast(d.message || 'eSIM 任务启动失败', 'err'); }
       }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
+    }
+    function esimInstallStart() {
+      var input = document.getElementById('esimActivationCode');
+      var start = document.getElementById('esimInstallStartBtn');
+      var compat = document.getElementById('esimEs9CompatMode');
+      if (!input || !input.value.trim()) {
+        showToast('请输入 Activation Code', 'err');
+        return;
+      }
+      if (start) start.disabled = true;
+      showToast('正在提交 eSIM 下载任务…', 'loading');
+      csrfFetch('/esim?action=install-start', {
+        method: 'POST', cache: 'no-store',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'activationCode=' + encodeURIComponent(input.value.trim()) +
+          (compat && compat.checked ? '&es9CompatMode=1' : '')
+      }).then(jsonOrThrow).then(function(d) {
+        if (d.success && d.queued) {
+          input.value = '';
+          showToast(d.message || '下载任务已排队', 'loading');
+          esimLoadStatus(true);
+        } else {
+          if (start) start.disabled = false;
+          showToast(d.message || '下载任务启动失败', 'err');
+        }
+      }).catch(function(e) {
+        if (start) start.disabled = false;
+        showToast('请求失败: ' + e, 'err');
+      });
+    }
+    function esimInstallSubmitConfirmation() {
+      var input = document.getElementById('esimConfirmationCode');
+      var submit = document.getElementById('esimConfirmationSubmitBtn');
+      if (!input || !input.value.trim()) {
+        showToast('请输入 Confirmation Code', 'err');
+        return;
+      }
+      if (submit) submit.disabled = true;
+      csrfFetch('/esim?action=install-confirmation-code', {
+        method: 'POST', cache: 'no-store',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'confirmationCode=' + encodeURIComponent(input.value)
+      }).then(jsonOrThrow).then(function(d) {
+        if (d.success) input.value = '';
+        showToast(d.message || 'Confirmation Code 提交失败', d.success ? 'loading' : 'err');
+        esimLoadStatus(true);
+      }).catch(function(e) {
+        if (submit) submit.disabled = false;
+        showToast('请求失败: ' + e, 'err');
+      });
     }
     function esimInfo() { esimStart('info'); }
     function esimRefresh() { esimStart('refresh'); }
