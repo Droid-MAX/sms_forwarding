@@ -691,23 +691,27 @@ static void expire_concat_slots()
     }
 }
 
-// ===== 来电通知 =====
-// 一通来电会重复上报 RING/+CLIP，只在"新来电"时通知一次；超过间隔视为新的一通。
-static int64_t s_call_window_us = 0;   // 当前来电最近一次 RING/+CLIP 时间
+// ===== 来电通知（使用 AT+CLCC 主动查询） =====
+static int64_t s_call_window_us = 0;   // 当前来电最近一次 RING/+CLCC 时间
 static bool s_call_notified = false;   // 当前来电是否已通知
-static bool s_call_saw_ring = false;   // 当前来电是否见过 RING(未知号码兜底用)
-static std::string s_call_number;      // 当前来电号码(来自 +CLIP)
-static constexpr int64_t CALL_GAP_US = 30LL * 1000 * 1000;          // 超过则视为新来电
-static constexpr int64_t CALL_UNKNOWN_DELAY_US = 3LL * 1000 * 1000; // RING 后等 +CLIP 的宽限
+static constexpr int64_t CALL_GAP_US = 30LL * 1000 * 1000; // 超过则视为新来电
 
-// 从 +CLIP: "号码",类型,... 中取第一对引号内的号码
-static std::string parse_clip_number(const std::string& line)
+// 查询 AT+CLCC 并解析主叫号码（第一对双引号内内容）
+static std::string query_clcc_number()
 {
-    size_t q1 = line.find('"');
+    std::string resp;
+    if (idf_modem_send_at("AT+CLCC", 3000, resp) != ESP_OK) {
+        idf_logf("来电号码查询失败");
+        return {};
+    }
+    // 查找 +CLCC: 行，并提取第一个双引号内的号码
+    size_t pos = resp.find("+CLCC:");
+    if (pos == std::string::npos) return {};
+    size_t q1 = resp.find('"', pos);
     if (q1 == std::string::npos) return {};
-    size_t q2 = line.find('"', q1 + 1);
+    size_t q2 = resp.find('"', q1 + 1);
     if (q2 == std::string::npos) return {};
-    return line.substr(q1 + 1, q2 - q1 - 1);
+    return resp.substr(q1 + 1, q2 - q1 - 1);
 }
 
 static void notify_incoming_call(const std::string& number)
@@ -732,35 +736,21 @@ static void notify_incoming_call(const std::string& number)
     }
 }
 
-// RING/+CLIP 独立于短信处理；同一通来电只通知一次
+// RING/+CLCC 独立于短信处理；同一通来电只通知一次
 static void handle_call_urc_line(const std::string& line)
 {
+    if (line != "RING") return;
+
     int64_t now = esp_timer_get_time();
-    if (now - s_call_window_us > CALL_GAP_US) {  // 新来电：重置去重状态
+    if (now - s_call_window_us > CALL_GAP_US) {  // 新来电重置状态
         s_call_notified = false;
-        s_call_saw_ring = false;
-        s_call_number.clear();
     }
     s_call_window_us = now;
-    if (starts_with(line, "+CLIP:")) {
-        std::string num = parse_clip_number(line);
-        if (!num.empty()) s_call_number = num;
-        if (!s_call_notified) {
-            s_call_notified = true;
-            notify_incoming_call(s_call_number);
-        }
-    } else {  // RING：号码可能随后由 +CLIP 补上，无号码时由 flush 兜底
-        s_call_saw_ring = true;
-    }
-}
 
-// RING 后迟迟没有 +CLIP(号码被隐藏)：宽限期后按未知号码通知一次
-static void flush_pending_call_notify(void)
-{
-    if (s_call_saw_ring && !s_call_notified &&
-        esp_timer_get_time() - s_call_window_us > CALL_UNKNOWN_DELAY_US) {
+    if (!s_call_notified) {
         s_call_notified = true;
-        notify_incoming_call(std::string());
+        std::string number = query_clcc_number();
+        notify_incoming_call(number);
     }
 }
 
@@ -769,8 +759,8 @@ static void process_urc_line(const std::string& raw)
     std::string line = idf_util_trim_copy(raw);
     if (line.empty()) return;
 
-    // 来电通知：RING/+CLIP 优先处理并返回，独立于短信 PDU 等待逻辑
-    if (line == "RING" || starts_with(line, "+CLIP:")) {
+    // 来电通知：仅处理 RING 并返回，独立于短信 PDU 等待逻辑
+    if (line == "RING") {
         handle_call_urc_line(line);
         return;
     }
@@ -1034,7 +1024,6 @@ static void sms_task(void*)
         std::string urc;
         if (idf_modem_take_urc(urc)) process_urc_text(urc);
         expire_wait_pdu_window();
-        flush_pending_call_notify();
         expire_concat_slots();
 
         // eSIM 逻辑通道期间只收 URC，不插入 CPMS、CMGL 或短信发送 AT。
