@@ -1741,7 +1741,7 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
         bool reset_puk = next_credentials[i].pukFailedAttempts == UINT8_MAX;
         next_credentials[i].pinFailedAttempts = 0;
         next_credentials[i].pukFailedAttempts = 0;
-        for (const auto& old : current.simCredentials) {
+        for (const auto& old : current.credentials) {
             if (old.iccid != next_credentials[i].iccid) continue;
             if (next_credentials[i].pin.empty()) next_credentials[i].pin = old.pin;
             else if (next_credentials[i].pin != old.pin) next_credentials[i].pinFailedAttempts = 0;
