@@ -3,7 +3,6 @@
 #include <stddef.h>
 
 #include <string>
-#include <vector>
 
 #include "esp_err.h"
 
@@ -11,8 +10,6 @@
 struct LpaActivationCode {
     std::string smdpHost;
     std::string matchingId;
-    bool confirmationCodeRequired = false;
-    std::vector<std::string> extensions;
 
     LpaActivationCode() = default;
     LpaActivationCode(const LpaActivationCode&) = delete;
@@ -65,7 +62,6 @@ struct LpaDownloadStats {
     size_t bppDecodedBytes = 0;
     size_t freeHeapAtStart = 0;
     size_t freeHeapAtEnd = 0;
-    size_t peakFreeHeap = 0;
     size_t minimumFreeHeap = 0;
     size_t largestFreeBlock = 0;
 };

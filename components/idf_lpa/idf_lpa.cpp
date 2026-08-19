@@ -1,7 +1,6 @@
 #include "idf_lpa.h"
 
 #include <ctype.h>
-#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -18,6 +17,7 @@
 #include "idf_esim_codec.h"
 #include "idf_esim_lpa.h"
 #include "idf_log.h"
+#include "idf_util.h"
 #include "idf_modem.h"
 #include "mbedtls/base64.h"
 #include "psa/crypto.h"
@@ -31,8 +31,8 @@ static constexpr size_t kMaxMatchingIdLength = 128;
 static constexpr size_t kMaxHostLength = 253;
 static constexpr size_t kMaxOptionalFieldLength = 64;
 static constexpr size_t kMaxCoreFields = 3;
-static constexpr size_t kMaxStoredExtensions = 4;
-static constexpr size_t kMaxActivationFields = kMaxCoreFields + kMaxStoredExtensions;
+static constexpr size_t kMaxOptionalFields = 4;
+static constexpr size_t kMaxActivationFields = kMaxCoreFields + kMaxOptionalFields;
 
 static void clear_string(std::string& value)
 {
@@ -241,36 +241,22 @@ static bool equal_ascii_ci(const std::string& left, const char* right)
     return true;
 }
 
-static std::string lower_ascii_copy(const std::string& value)
+static int compare_ascii_ci(const std::string& left, const std::string& right)
 {
-    std::string out = value;
-    for (char& ch : out) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
-    return out;
+    const size_t count = std::min(left.size(), right.size());
+    for (size_t i = 0; i < count; ++i) {
+        const int left_ch = tolower(static_cast<unsigned char>(left[i]));
+        const int right_ch = tolower(static_cast<unsigned char>(right[i]));
+        if (left_ch != right_ch) return left_ch < right_ch ? -1 : 1;
+    }
+    if (left.size() == right.size()) return 0;
+    return left.size() < right.size() ? -1 : 1;
 }
 
 static void append_json_string(std::string& out, const std::string& value)
 {
     out.push_back('"');
-    for (unsigned char ch : value) {
-        switch (ch) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (ch < 0x20U) {
-                    char buf[7];
-                    snprintf(buf, sizeof(buf), "\\u%04X", static_cast<unsigned>(ch));
-                    out += buf;
-                } else {
-                    out.push_back(static_cast<char>(ch));
-                }
-                break;
-        }
-    }
+    idf_util_json_escape_append(out, value);
     out.push_back('"');
 }
 
@@ -320,19 +306,17 @@ static void set_es9_http_error(std::string& message,
                                int status_code,
                                const Es9HttpDiagnostics& diagnostics)
 {
-    const char* errno_text = diagnostics.transportErrno > 0
-        ? strerror(diagnostics.transportErrno)
-        : "none";
     char buffer[320];
     snprintf(buffer, sizeof(buffer),
-             "ES9+ %s HTTPS 请求失败（err=%s/0x%08X，errno=%d/%s，tls=%s/0x%08X，tlsCode=0x%08X，flags=0x%08X，HTTP=%d）",
+             "ES9+ %s HTTPS 请求失败（err=%s/0x%08X，errno=%d，tls=%s/0x%08X，tlsCode=0x%08X，flags=0x%08X，HTTP=%d）",
              operation ? operation : "请求",
              esp_err_to_name(error), static_cast<unsigned>(error),
-             diagnostics.transportErrno, errno_text,
+             diagnostics.transportErrno,
              esp_err_to_name(diagnostics.tlsError), static_cast<unsigned>(diagnostics.tlsError),
              static_cast<unsigned>(diagnostics.tlsCode),
              static_cast<unsigned>(diagnostics.tlsFlags), status_code);
     message = buffer;
+    idf_log_line(message.c_str());
 }
 
 static esp_err_t es9_http_event_handler(esp_http_client_event_t* event)
@@ -372,31 +356,6 @@ static const char* rsp_protocol_state(const std::string& protocol, bool seen)
     return valid_rsp_protocol(protocol) ? "valid" : "invalid";
 }
 
-static void log_es9_http_summary(const char* operation,
-                                 esp_err_t error,
-                                 int status_code,
-                                 size_t body_bytes,
-                                 bool body_overflow,
-                                 const std::string& protocol,
-                                 bool protocol_seen,
-                                 const Es9HttpDiagnostics& diagnostics)
-{
-    const char* op = operation ? operation : "请求";
-    const char* protocol_state = rsp_protocol_state(protocol, protocol_seen);
-    if (error == ESP_OK) {
-        idf_logf("ES9+ %s: HTTP=%d err=%s/0x%08X bodyBytes=%u overflow=%d protocol=%s",
-                 op, status_code, esp_err_to_name(error), static_cast<unsigned>(error),
-                 static_cast<unsigned>(body_bytes), body_overflow ? 1 : 0, protocol_state);
-        return;
-    }
-    idf_logf("ES9+ %s: HTTP=%d err=0x%08X bytes=%u ov=%d proto=%s errno=%d tls=0x%08X code=0x%08X flags=0x%08X",
-             op, status_code, static_cast<unsigned>(error),
-             static_cast<unsigned>(body_bytes), body_overflow ? 1 : 0, protocol_state,
-             diagnostics.transportErrno, static_cast<unsigned>(diagnostics.tlsError),
-             static_cast<unsigned>(diagnostics.tlsCode),
-             static_cast<unsigned>(diagnostics.tlsFlags));
-}
-
 static bool check_rsp_protocol(const std::string& protocol,
                                bool protocol_seen,
                                bool allow_missing_protocol,
@@ -423,7 +382,8 @@ static esp_err_t es9_post_json(const std::string& host,
                                const char* path,
                                const std::string& request_body,
                                std::string& response_body,
-                               std::string& message)
+                               std::string& message,
+                               bool allow_empty_response = false)
 {
     response_body.clear();
     uint32_t now = static_cast<uint32_t>(time(nullptr));
@@ -476,10 +436,15 @@ static esp_err_t es9_post_json(const std::string& host,
         err = esp_http_client_perform(client);
     }
     int status_code = esp_http_client_get_status_code(client);
-    Es9HttpDiagnostics diagnostics = collect_es9_http_diagnostics(client);
-    log_es9_http_summary(operation, err, status_code, capture.responseBytes,
-                         capture.bodyOverflow, capture.adminProtocol,
-                         capture.adminProtocolSeen, diagnostics);
+    Es9HttpDiagnostics diagnostics;
+    if (err == ESP_OK) {
+        idf_logf("ES9+ %s: HTTP=%d bodyBytes=%u overflow=%d protocol=%s",
+                 operation ? operation : "请求", status_code,
+                 static_cast<unsigned>(capture.responseBytes), capture.bodyOverflow ? 1 : 0,
+                 rsp_protocol_state(capture.adminProtocol, capture.adminProtocolSeen));
+    } else {
+        diagnostics = collect_es9_http_diagnostics(client);
+    }
     esp_http_client_cleanup(client);
 
     if (capture.bodyOverflow) {
@@ -490,7 +455,7 @@ static esp_err_t es9_post_json(const std::string& host,
         set_es9_http_error(message, operation, err, status_code, diagnostics);
         return err;
     }
-    if (status_code != 200) {
+    if (status_code != 200 && !(allow_empty_response && status_code == 204)) {
         char buf[64];
         snprintf(buf, sizeof(buf), "ES9+ HTTP 状态异常（%d）", status_code);
         message = buf;
@@ -501,6 +466,7 @@ static esp_err_t es9_post_json(const std::string& host,
         return ESP_ERR_INVALID_RESPONSE;
     }
     if (capture.body.empty()) {
+        if (allow_empty_response) return ESP_OK;
         message = "ES9+ 响应为空";
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -692,27 +658,6 @@ static const idf_esim_internal::Tlv* unique_child(const idf_esim_internal::Tlv& 
     return found;
 }
 
-static std::string safe_tlv_shape(const idf_esim_internal::Tlv& parent)
-{
-    std::string shape;
-    constexpr size_t kMaxChildren = 8;
-    for (size_t i = 0; i < parent.children.size() && i < kMaxChildren; ++i) {
-        if (!shape.empty()) shape.push_back('/');
-        const idf_esim_internal::Tlv& child = parent.children[i];
-        for (uint8_t byte : child.tag) {
-            char part[4];
-            snprintf(part, sizeof(part), "%02X", static_cast<unsigned>(byte));
-            shape += part;
-        }
-        char length[24];
-        snprintf(length, sizeof(length), ":%u",
-                 static_cast<unsigned>(child.value.size()));
-        shape += length;
-    }
-    if (parent.children.size() > kMaxChildren) shape += "/...";
-    return shape.empty() ? std::string("empty") : shape;
-}
-
 static void clear_tlv_sensitive(idf_esim_internal::Tlv& tlv)
 {
     for (idf_esim_internal::Tlv& child : tlv.children) clear_tlv_sensitive(child);
@@ -774,8 +719,7 @@ static bool validate_server_signed1(const std::vector<uint8_t>& encoded,
     }
     address.text.assign(reinterpret_cast<const char*>(address_tlv->value.data()),
                         address_tlv->value.size());
-    if (!is_printable_ascii(address.text) ||
-        lower_ascii_copy(address.text) != lower_ascii_copy(host)) {
+    if (!is_printable_ascii(address.text) || compare_ascii_ci(address.text, host) != 0) {
         message = "ES9+ serverSigned1 服务器地址不匹配";
         return false;
     }
@@ -913,30 +857,17 @@ static bool parse_success_status(const std::string& json, std::string& message)
 }
 
 struct LpaAuthSession {
-    SensitiveBytes euiccInfo1;
-    SensitiveBytes euiccChallenge;
     SensitiveBytes transactionId;
-    SensitiveBytes serverSigned1;
-    SensitiveBytes serverSignature1;
-    SensitiveBytes ciKeyId;
-    SensitiveBytes serverCertificate;
-    SensitiveBytes authenticateServerRequest;
-    SensitiveBytes authenticateServerResponse;
-    SensitiveBytes prepareDownloadResponse;
-    SensitiveBytes profileMetadata;
     SensitiveBytes smdpSigned2;
     SensitiveBytes smdpSignature2;
     SensitiveBytes smdpCertificate;
-    bool confirmationCodeRequired = false;
 };
 
 }  // namespace
 
 LpaActivationCode::LpaActivationCode(LpaActivationCode&& other) noexcept
     : smdpHost(std::move(other.smdpHost)),
-      matchingId(std::move(other.matchingId)),
-      confirmationCodeRequired(other.confirmationCodeRequired),
-      extensions(std::move(other.extensions))
+      matchingId(std::move(other.matchingId))
 {
     other.clear_sensitive();
 }
@@ -947,8 +878,6 @@ LpaActivationCode& LpaActivationCode::operator=(LpaActivationCode&& other) noexc
         clear_sensitive();
         smdpHost = std::move(other.smdpHost);
         matchingId = std::move(other.matchingId);
-        confirmationCodeRequired = other.confirmationCodeRequired;
-        extensions = std::move(other.extensions);
         other.clear_sensitive();
     }
     return *this;
@@ -958,9 +887,6 @@ void LpaActivationCode::clear_sensitive()
 {
     clear_string(smdpHost);
     clear_string(matchingId);
-    for (std::string& extension : extensions) clear_string(extension);
-    std::vector<std::string>().swap(extensions);
-    confirmationCodeRequired = false;
 }
 
 LpaActivationCode::~LpaActivationCode()
@@ -1051,12 +977,6 @@ bool idf_lpa_parse_activation_code(const std::string& input,
 
     out.smdpHost = fields.values[1];
     out.matchingId = fields.values[2];
-    // Gate 2 不猜测扩展字段语义；真实 CC-required 规则留给 Gate 3 的协议响应。
-    out.confirmationCodeRequired = false;
-    for (size_t i = kMaxCoreFields; i < fields.values.size() &&
-                         out.extensions.size() < kMaxStoredExtensions; ++i) {
-        out.extensions.push_back(fields.values[i]);
-    }
     return true;
 }
 
@@ -1091,15 +1011,15 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
         return ESP_ERR_INVALID_ARG;
     }
 
-    SensitiveBytes& euicc_info1 = session.euiccInfo1;
-    SensitiveBytes& server_signed1 = session.serverSigned1;
-    SensitiveBytes& server_signature1 = session.serverSignature1;
-    SensitiveBytes& ci_key_id = session.ciKeyId;
-    SensitiveBytes& server_certificate = session.serverCertificate;
+    SensitiveBytes euicc_info1;
+    SensitiveBytes server_signed1;
+    SensitiveBytes server_signature1;
+    SensitiveBytes ci_key_id;
+    SensitiveBytes server_certificate;
     SensitiveBytes& transaction_id = session.transactionId;
-    SensitiveBytes& authenticate_server_request = session.authenticateServerRequest;
-    SensitiveBytes& authenticate_server_response = session.authenticateServerResponse;
-    SensitiveBytes& profile_metadata = session.profileMetadata;
+    SensitiveBytes authenticate_server_request;
+    SensitiveBytes authenticate_server_response;
+    SensitiveBytes profile_metadata;
     SensitiveBytes& smdp_signed2 = session.smdpSigned2;
     SensitiveBytes& smdp_signature2 = session.smdpSignature2;
     SensitiveBytes& smdp_certificate = session.smdpCertificate;
@@ -1111,7 +1031,6 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
                                                    safe_message);
     if (err != ESP_OK) return err;
 
-    session.euiccChallenge.value.assign(euicc_challenge.begin(), euicc_challenge.end());
     SensitiveBytes challenge_bytes;
     challenge_bytes.value.assign(euicc_challenge.begin(), euicc_challenge.end());
     SensitiveText euicc_challenge_b64;
@@ -1315,7 +1234,6 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
         return ESP_ERR_INVALID_RESPONSE;
     }
     result.confirmationCodeRequired = cc_required->value[0] != 0U;
-    session.confirmationCodeRequired = result.confirmationCodeRequired;
     safe_message = result.confirmationCodeRequired
         ? "ES9+ 认证完成，服务器要求 Confirmation Code"
         : "ES9+ 认证完成，尚未写入 Profile";
@@ -1344,16 +1262,12 @@ static void download_phase(const LpaDownloadObserver& observer,
     if (observer.set_phase) observer.set_phase(observer.context, phase, message);
 }
 
-static void sample_heap(LpaDownloadStats& stats)
+static void sample_largest_free_block(LpaDownloadStats& stats)
 {
-    const size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    const size_t minimum = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
     const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    if (free_heap > stats.peakFreeHeap) stats.peakFreeHeap = free_heap;
-    if (stats.minimumFreeHeap == 0 || minimum < stats.minimumFreeHeap) {
-        stats.minimumFreeHeap = minimum;
+    if (stats.largestFreeBlock == 0 || largest < stats.largestFreeBlock) {
+        stats.largestFreeBlock = largest;
     }
-    if (largest > stats.largestFreeBlock) stats.largestFreeBlock = largest;
 }
 
 class BppSegmentWriter {
@@ -2429,7 +2343,8 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
         err = esp_http_client_perform(client);
     }
     const int status_code = esp_http_client_get_status_code(client);
-    Es9HttpDiagnostics diagnostics = collect_es9_http_diagnostics(client);
+    Es9HttpDiagnostics diagnostics;
+    if (err != ESP_OK) diagnostics = collect_es9_http_diagnostics(client);
     const char* status_state = !scanner.status_seen()
         ? "missing"
         : (scanner.status() == "Executed-Success" ? "success" : "non-success");
@@ -2442,11 +2357,6 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
              static_cast<unsigned>(scanner.decoded_bpp_bytes()),
              static_cast<unsigned>(scanner.segment_count()),
              rsp_protocol_state(capture.adminProtocol, capture.adminProtocolSeen));
-    if (err != ESP_OK && capture.scannerError == ESP_OK) {
-        log_es9_http_summary("GetBoundProfilePackage", err, status_code,
-                             capture.responseBytes, false, capture.adminProtocol,
-                             capture.adminProtocolSeen, diagnostics);
-    }
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
@@ -2474,13 +2384,7 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
             if (!capture.errorMessage.empty()) {
                 message = capture.errorMessage;
             } else {
-                char detail[128];
-                snprintf(detail, sizeof(detail),
-                         "ES9+ BPP 响应解析失败（err=%s/0x%08X，responseBytes=%u）",
-                         esp_err_to_name(capture.scannerError),
-                         static_cast<unsigned>(capture.scannerError),
-                         static_cast<unsigned>(capture.responseBytes));
-                message = detail;
+                message = "ES9+ BPP 响应解析失败";
             }
         }
         return capture.scannerError;
@@ -2640,7 +2544,7 @@ static bool parse_prepare_download_response(const std::vector<uint8_t>& response
 
     const idf_esim_internal::Tlv* response_choice = success_choice;
     if (!response_choice) {
-        message = "PrepareDownload 响应对象不完整（外层字段=" + safe_tlv_shape(root) + "）";
+        message = "PrepareDownload 响应缺少成功或错误对象";
         return false;
     }
 
@@ -2652,8 +2556,7 @@ static bool parse_prepare_download_response(const std::vector<uint8_t>& response
         *response_choice, TAG_SEQUENCE, sizeof(TAG_SEQUENCE), duplicate_signed2);
     if (duplicate_signature || duplicate_signed2 || !signed2 || !signature ||
         signature->value.empty()) {
-        message = "PrepareDownload 响应对象不完整（字段=" +
-                  safe_tlv_shape(*response_choice) + "）";
+        message = "PrepareDownload 响应缺少签名字段";
         return false;
     }
     bool duplicate_otpk = false;
@@ -2793,60 +2696,19 @@ static esp_err_t es9_post_notification(const std::string& host,
                                        const std::string& request_body,
                                        std::string& message)
 {
-    uint32_t now = static_cast<uint32_t>(time(nullptr));
-    if (now < kMinimumValidEpoch) {
-        message = "设备时间未同步，不能连接 SM-DP+";
-        return ESP_ERR_INVALID_STATE;
-    }
-    std::string url = "https://" + host + "/gsma/rsp2/es9plus/handleNotification";
-    Es9HttpCapture capture;
-    esp_http_client_config_t config = {};
-    config.url = url.c_str();
-    config.timeout_ms = static_cast<int>(kEs9TimeoutMs);
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.skip_cert_common_name_check = false;
-    config.keep_alive_enable = false;
-    config.disable_auto_redirect = true;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = static_cast<int>(std::min<size_t>(32768U,
-        std::max<size_t>(2048U, request_body.size() + 512U)));
-    config.event_handler = es9_http_event_handler;
-    config.user_data = &capture;
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        message = "ES9+ HandleNotification HTTPS 客户端内存不足";
-        return ESP_ERR_NO_MEM;
-    }
-    esp_err_t err = esp_http_client_set_method(client, HTTP_METHOD_POST);
-    if (err == ESP_OK) err = esp_http_client_set_header(client, "Content-Type", "application/json");
-    if (err == ESP_OK) err = esp_http_client_set_header(client, "User-Agent", "gsma-rsp-lpad");
-    if (err == ESP_OK) err = esp_http_client_set_header(client, "X-Admin-Protocol", "gsma/rsp/v2.7.0");
-    if (err == ESP_OK) err = esp_http_client_set_post_field(client, request_body.data(),
-                                                              request_body.size());
-    if (err == ESP_OK) err = esp_http_client_perform(client);
-    const int status_code = esp_http_client_get_status_code(client);
-    Es9HttpDiagnostics diagnostics = collect_es9_http_diagnostics(client);
-    esp_http_client_cleanup(client);
+    SensitiveText response;
+    esp_err_t err = es9_post_json(host,
+                                  "HandleNotification",
+                                  allow_missing_protocol,
+                                  "/gsma/rsp2/es9plus/handleNotification",
+                                  request_body,
+                                  response.text,
+                                  message,
+                                  true);
     if (err != ESP_OK) {
-        set_es9_http_error(message, "HandleNotification", err, status_code, diagnostics);
         return err;
     }
-    if (status_code != 200 && status_code != 204) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "ES9+ HandleNotification HTTP 状态异常（%d）", status_code);
-        message = buf;
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (capture.bodyOverflow) {
-        message = "ES9+ HandleNotification 响应超过大小上限";
-        return ESP_ERR_INVALID_SIZE;
-    }
-    if (!check_rsp_protocol(capture.adminProtocol, capture.adminProtocolSeen,
-                             allow_missing_protocol, "HandleNotification", message)) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (status_code == 200 && !capture.body.empty() &&
-        !parse_success_status(capture.body, message)) {
+    if (!response.text.empty() && !parse_success_status(response.text, message)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     return ESP_OK;
@@ -2880,16 +2742,26 @@ static esp_err_t recover_pending_installation_notifications(
         notification.address = info.notificationAddress.text;
         pending.push_back(std::move(notification));
     }
-    std::sort(pending.begin(), pending.end(), [](const PendingInstallationNotification& left,
-                                                 const PendingInstallationNotification& right) {
-        const std::string left_address = lower_ascii_copy(left.address);
-        const std::string right_address = lower_ascii_copy(right.address);
-        if (left_address != right_address) return left_address < right_address;
-        return left.sequenceNumber < right.sequenceNumber;
-    });
+    auto notification_less = [](const PendingInstallationNotification& left,
+                                const PendingInstallationNotification& right) {
+        const int address_order = compare_ascii_ci(left.address, right.address);
+        return address_order != 0
+            ? address_order < 0
+            : left.sequenceNumber < right.sequenceNumber;
+    };
+    // 卡侧 pending list 很小，原地插入排序比 std::sort 的模板代码和临时小写字符串更省空间。
+    for (size_t i = 1; i < pending.size(); ++i) {
+        PendingInstallationNotification current = std::move(pending[i]);
+        size_t insert_at = i;
+        while (insert_at > 0 && notification_less(current, pending[insert_at - 1U])) {
+            pending[insert_at] = std::move(pending[insert_at - 1U]);
+            --insert_at;
+        }
+        pending[insert_at] = std::move(current);
+    }
     for (size_t i = 1; i < pending.size(); ++i) {
         if (pending[i - 1U].sequenceNumber == pending[i].sequenceNumber &&
-            lower_ascii_copy(pending[i - 1U].address) == lower_ascii_copy(pending[i].address)) {
+            compare_ascii_ci(pending[i - 1U].address, pending[i].address) == 0) {
             message = "eUICC 返回了重复的待发送通知序号";
             return ESP_ERR_INVALID_RESPONSE;
         }
@@ -2925,14 +2797,24 @@ struct DownloadStatsGuard {
     explicit DownloadStatsGuard(LpaDownloadStats& value) : stats(value)
     {
         stats.freeHeapAtStart = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-        sample_heap(stats);
+        monitorStarted = heap_caps_monitor_local_minimum_free_size_start() == ESP_OK;
+        if (monitorStarted) {
+            sample_largest_free_block(stats);
+        } else {
+            idf_log_line("eSIM 下载堆最低值监控启动失败");
+        }
     }
     ~DownloadStatsGuard()
     {
+        if (monitorStarted) {
+            sample_largest_free_block(stats);
+            stats.minimumFreeHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+            heap_caps_monitor_local_minimum_free_size_stop();
+        }
         stats.freeHeapAtEnd = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-        sample_heap(stats);
     }
     LpaDownloadStats& stats;
+    bool monitorStarted = false;
 };
 
 }  // namespace
@@ -2964,7 +2846,7 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
     err = run_authentication_session(activation_code,
                                      observer.allow_missing_admin_protocol,
                                      auth_result, session, safe_message);
-    sample_heap(stats);
+    sample_largest_free_block(stats);
     if (err != ESP_OK) return failed(err);
 
     SensitiveBytes hash_cc;
@@ -3000,11 +2882,10 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
                                          safe_message)) {
         return failed(ESP_ERR_INVALID_RESPONSE);
     }
-    session.prepareDownloadResponse.value = std::move(prepare_response.value);
-    sample_heap(stats);
+    sample_largest_free_block(stats);
 
     SensitiveText prepare_b64;
-    if (!base64_encode_bytes(session.prepareDownloadResponse.value, prepare_b64.text,
+    if (!base64_encode_bytes(prepare_response.value, prepare_b64.text,
                              safe_message)) {
         return failed(ESP_ERR_INVALID_SIZE);
     }
@@ -3051,8 +2932,7 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
         safe_message = "ProfileInstallationResult transactionId 不匹配";
         return failed(ESP_ERR_INVALID_RESPONSE);
     }
-    if (lower_ascii_copy(pir_info.notificationAddress.text) !=
-        lower_ascii_copy(activation_code.smdpHost)) {
+    if (compare_ascii_ci(pir_info.notificationAddress.text, activation_code.smdpHost) != 0) {
         safe_message = "ProfileInstallationResult notification 地址无效";
         return failed(ESP_ERR_INVALID_RESPONSE);
     }
@@ -3060,7 +2940,7 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
         safe_message = "ProfileInstallationResult 报告安装失败";
         return failed(ESP_ERR_INVALID_RESPONSE);
     }
-    sample_heap(stats);
+    sample_largest_free_block(stats);
 
     download_phase(observer, "notify", "正在向 SM-DP+ 确认安装结果");
     SensitiveText pir_b64;
