@@ -5,6 +5,7 @@ idf_component_register(
     heap
     esp_http_client
     esp-tls
+    freertos
     idf_esim
     idf_logbuf
     idf_modem

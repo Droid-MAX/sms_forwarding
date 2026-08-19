@@ -1,6 +1,7 @@
 #include "idf_lpa.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -14,6 +15,10 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_timer.h"
+#include "esp_tls_errors.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "idf_esim_codec.h"
 #include "idf_esim_lpa.h"
 #include "idf_log.h"
@@ -194,7 +199,9 @@ static bool split_fields(const std::string& value, SensitiveFields& fields)
 static constexpr size_t kMaxEs9JsonBody = 24U * 1024U;
 static constexpr size_t kMaxEs9Object = 8U * 1024U;
 static constexpr uint32_t kMinimumValidEpoch = 1700000000U;
-static constexpr uint32_t kEs9TimeoutMs = 15000U;
+static constexpr uint32_t kEs9IoTimeoutMs = 15000U;
+static constexpr uint32_t kEs9TransactionTimeoutMs = 60000U;
+static constexpr uint32_t kEs9BppTransactionTimeoutMs = 30U * 60U * 1000U;
 
 static void clear_sensitive_bytes(std::vector<uint8_t>& value)
 {
@@ -275,6 +282,7 @@ static void append_json_field(std::string& out,
 struct Es9HttpCapture {
     std::string body;
     std::string adminProtocol;
+    esp_err_t streamError = ESP_OK;
     bool adminProtocolSeen = false;
     bool bodyOverflow = false;
     size_t responseBytes = 0;
@@ -288,6 +296,97 @@ struct Es9HttpDiagnostics {
     int tlsFlags = 0;
     esp_err_t tlsError = ESP_OK;
 };
+
+class Es9Deadline {
+public:
+    explicit Es9Deadline(uint32_t timeout_ms)
+        : deadline_us_(esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000LL) {}
+
+    bool expired() const { return esp_timer_get_time() >= deadline_us_; }
+
+    bool apply(esp_http_client_handle_t client) const
+    {
+        if (!client || expired()) return false;
+        const int64_t remaining_us = deadline_us_ - esp_timer_get_time();
+        const int64_t remaining_ms = (remaining_us + 999LL) / 1000LL;
+        return esp_http_client_set_timeout_ms(
+                   client, static_cast<int>(std::max<int64_t>(
+                               1LL, std::min<int64_t>(kEs9IoTimeoutMs, remaining_ms)))) == ESP_OK;
+    }
+
+private:
+    int64_t deadline_us_;
+};
+
+static esp_err_t es9_http_stream_request(esp_http_client_handle_t client,
+                                         const std::string& request_body,
+                                         Es9Deadline& deadline,
+                                         const esp_err_t* stream_error)
+{
+    if (!client || request_body.empty() ||
+        request_body.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!deadline.apply(client)) return ESP_ERR_TIMEOUT;
+
+    esp_err_t err = ESP_OK;
+    while (true) {
+        if (!deadline.apply(client)) return ESP_ERR_TIMEOUT;
+        err = esp_http_client_open(client, static_cast<int>(request_body.size()));
+        if (err == ESP_OK) break;
+        if (err != ESP_ERR_HTTP_EAGAIN) return deadline.expired() ? ESP_ERR_TIMEOUT : err;
+        vTaskDelay(1);
+    }
+
+    size_t written = 0;
+    while (written < request_body.size()) {
+        if (!deadline.apply(client)) return ESP_ERR_TIMEOUT;
+        const size_t chunk = std::min<size_t>(1024U, request_body.size() - written);
+        const int result = esp_http_client_write(
+            client, request_body.data() + written, static_cast<int>(chunk));
+        if (result <= 0) {
+            if (result == -ESP_ERR_HTTP_EAGAIN ||
+                result == ESP_TLS_ERR_SSL_WANT_READ ||
+                result == ESP_TLS_ERR_SSL_WANT_WRITE ||
+                errno == EAGAIN || errno == EWOULDBLOCK) {
+                vTaskDelay(1);
+                continue;
+            }
+            return deadline.expired() ? ESP_ERR_TIMEOUT : ESP_ERR_HTTP_WRITE_DATA;
+        }
+        written += static_cast<size_t>(result);
+    }
+
+    while (true) {
+        if (!deadline.apply(client)) return ESP_ERR_TIMEOUT;
+        const int64_t content_length = esp_http_client_fetch_headers(client);
+        if (content_length >= 0) break;
+        if (content_length != -ESP_ERR_HTTP_EAGAIN && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return deadline.expired() ? ESP_ERR_TIMEOUT : ESP_ERR_HTTP_FETCH_HEADER;
+        }
+        vTaskDelay(1);
+    }
+    if (stream_error && *stream_error != ESP_OK) return *stream_error;
+
+    std::array<char, 256> read_buffer = {};
+    while (!esp_http_client_is_complete_data_received(client)) {
+        if (stream_error && *stream_error != ESP_OK) return *stream_error;
+        if (!deadline.apply(client)) return ESP_ERR_TIMEOUT;
+        const int result = esp_http_client_read(client, read_buffer.data(), read_buffer.size());
+        if (stream_error && *stream_error != ESP_OK) return *stream_error;
+        if (result == -ESP_ERR_HTTP_EAGAIN ||
+            (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+            vTaskDelay(1);
+            continue;
+        }
+        if (result < 0) return deadline.expired() ? ESP_ERR_TIMEOUT : ESP_FAIL;
+        if (result == 0) {
+            if (esp_http_client_is_complete_data_received(client)) return ESP_OK;
+            return deadline.expired() ? ESP_ERR_TIMEOUT : ESP_ERR_HTTP_INCOMPLETE_DATA;
+        }
+    }
+    return stream_error && *stream_error != ESP_OK ? *stream_error : ESP_OK;
+}
 
 static Es9HttpDiagnostics collect_es9_http_diagnostics(esp_http_client_handle_t client)
 {
@@ -306,6 +405,14 @@ static void set_es9_http_error(std::string& message,
                                int status_code,
                                const Es9HttpDiagnostics& diagnostics)
 {
+    if (error == ESP_ERR_TIMEOUT) {
+        char buffer[96];
+        snprintf(buffer, sizeof(buffer), "ES9+ %s 总事务超时",
+                 operation ? operation : "请求");
+        message = buffer;
+        idf_log_line(message.c_str());
+        return;
+    }
     char buffer[320];
     snprintf(buffer, sizeof(buffer),
              "ES9+ %s HTTPS 请求失败（err=%s/0x%08X，errno=%d，tls=%s/0x%08X，tlsCode=0x%08X，flags=0x%08X，HTTP=%d）",
@@ -338,6 +445,7 @@ static esp_err_t es9_http_event_handler(esp_http_client_event_t* event)
         if (data_len > kMaxEs9JsonBody ||
             capture->body.size() > kMaxEs9JsonBody - data_len) {
             capture->bodyOverflow = true;
+            capture->streamError = ESP_ERR_INVALID_SIZE;
             return ESP_OK;
         }
         capture->body.append(static_cast<const char*>(event->data), data_len);
@@ -406,11 +514,12 @@ static esp_err_t es9_post_json(const std::string& host,
     Es9HttpCapture capture;
     esp_http_client_config_t config = {};
     config.url = url.c_str();
-    config.timeout_ms = static_cast<int>(kEs9TimeoutMs);
+    config.timeout_ms = static_cast<int>(kEs9IoTimeoutMs);
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.skip_cert_common_name_check = false;
     config.keep_alive_enable = false;
     config.disable_auto_redirect = true;
+    config.is_async = true;
     config.buffer_size = 2048;
     size_t tx_size = request_body.size() + 512U;
     config.buffer_size_tx = static_cast<int>(std::min<size_t>(32768U, std::max<size_t>(2048U, tx_size)));
@@ -429,11 +538,9 @@ static esp_err_t es9_post_json(const std::string& host,
     if (err == ESP_OK) {
         err = esp_http_client_set_header(client, "X-Admin-Protocol", "gsma/rsp/v2.7.0");
     }
+    Es9Deadline deadline(kEs9TransactionTimeoutMs);
     if (err == ESP_OK) {
-        err = esp_http_client_set_post_field(client, request_body.data(), request_body.size());
-    }
-    if (err == ESP_OK) {
-        err = esp_http_client_perform(client);
+        err = es9_http_stream_request(client, request_body, deadline, &capture.streamError);
     }
     int status_code = esp_http_client_get_status_code(client);
     Es9HttpDiagnostics diagnostics;
@@ -445,6 +552,7 @@ static esp_err_t es9_post_json(const std::string& host,
     } else {
         diagnostics = collect_es9_http_diagnostics(client);
     }
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
     if (capture.bodyOverflow) {
@@ -1294,17 +1402,22 @@ public:
         }
         if (!data && length != 0) {
             message = "BPP segment 数据无效";
+            close();
             return ESP_ERR_INVALID_ARG;
         }
         if (length > kMaxBppSegmentBytes || segment_bytes_ > kMaxBppSegmentBytes - length) {
             message = "BPP segment 超过大小上限";
+            close();
             return ESP_ERR_INVALID_SIZE;
         }
         segment_bytes_ += length;
         while (length > 0) {
             if (pending_size_ == pending_.size()) {
                 esp_err_t err = flush(false, message);
-                if (err != ESP_OK) return err;
+                if (err != ESP_OK) {
+                    close();
+                    return err;
+                }
             }
             const size_t n = std::min(length, pending_.size() - pending_size_);
             memcpy(pending_.data() + pending_size_, data, n);
@@ -1471,6 +1584,7 @@ public:
 
     esp_err_t feed(const uint8_t* data, size_t length, std::string& message);
     esp_err_t finish(std::string& message);
+    void abort();
     const std::vector<uint8_t>& installation_result() const { return installation_result_.value; }
     size_t decoded_bytes() const { return decoded_bytes_; }
     size_t input_bytes() const { return input_bytes_; }
@@ -1583,6 +1697,13 @@ esp_err_t BppStreamParser::fail(const char* text, std::string& message)
     writer_.close();
     message = text ? text : "BPP 结构无效";
     return ESP_ERR_INVALID_RESPONSE;
+}
+
+void BppStreamParser::abort()
+{
+    record_failure();
+    state_ = State::failed;
+    writer_.close();
 }
 
 esp_err_t BppStreamParser::emit(const uint8_t* data, size_t length, std::string& message)
@@ -1962,6 +2083,7 @@ private:
 
     esp_err_t fail(const char* text, std::string& message)
     {
+        parser_.abort();
         message = text;
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -2034,6 +2156,7 @@ private:
 
     esp_err_t fail(const char* text)
     {
+        parser_.abort();
         failure_stage_ = "json";
         message_ = text;
         return ESP_ERR_INVALID_RESPONSE;
@@ -2197,9 +2320,9 @@ private:
 struct Es9BppCapture {
     BppJsonStreamScanner* scanner = nullptr;
     std::string* scannerMessage = nullptr;
+    Es9Deadline* deadline = nullptr;
     std::string adminProtocol;
     bool adminProtocolSeen = false;
-    std::string errorMessage;
     esp_err_t scannerError = ESP_OK;
     size_t responseBytes = 0;
     int statusCode = -1;
@@ -2238,30 +2361,39 @@ static esp_err_t es9_bpp_http_event_handler(esp_http_client_event_t* event)
         if (!capture->bodyPreflightChecked) {
             capture->bodyPreflightChecked = true;
             if (capture->statusCode != 200) {
-                capture->errorMessage = "ES9+ GetBPP HTTP 状态异常";
                 capture->scannerError = ESP_ERR_INVALID_RESPONSE;
+                *capture->scannerMessage = "ES9+ GetBPP HTTP 状态异常";
                 return capture->scannerError;
             }
             std::string protocol_message;
             if (!check_rsp_protocol(capture->adminProtocol, capture->adminProtocolSeen,
                                     capture->allowMissingProtocol, "GetBPP", protocol_message)) {
-                capture->errorMessage = protocol_message;
                 capture->scannerError = ESP_ERR_INVALID_RESPONSE;
-                if (capture->scannerMessage) *capture->scannerMessage = protocol_message;
+                *capture->scannerMessage = protocol_message;
                 return capture->scannerError;
             }
         }
         if (capture->responseBytes > kMaxBppEncodedBytes + 64U * 1024U ||
             length > kMaxBppEncodedBytes + 64U * 1024U - capture->responseBytes) {
-            capture->errorMessage = "ES9+ BPP 响应超过大小上限";
             capture->scannerError = ESP_ERR_INVALID_SIZE;
+            *capture->scannerMessage = "ES9+ BPP 响应超过大小上限";
             return capture->scannerError;
         }
         capture->responseBytes += length;
         if (capture->scanner && capture->scannerError == ESP_OK) {
-            capture->scannerError = capture->scanner->feed(static_cast<const char*>(event->data),
-                                                            length);
-            if (capture->scannerError != ESP_OK) {
+            size_t offset = 0;
+            while (offset < length && capture->scannerError == ESP_OK) {
+                if (capture->deadline && capture->deadline->expired()) {
+                    capture->scannerError = ESP_ERR_TIMEOUT;
+                    *capture->scannerMessage = "ES9+ GetBPP 总事务超时";
+                    break;
+                }
+                const size_t chunk = std::min<size_t>(128U, length - offset);
+                capture->scannerError = capture->scanner->feed(
+                    static_cast<const char*>(event->data) + offset, chunk);
+                offset += chunk;
+            }
+            if (capture->scannerError != ESP_OK && capture->scannerError != ESP_ERR_TIMEOUT) {
                 // 只记录有界的阶段、偏移、状态和当前 TLV header，便于定位流式解析错位。
                 idf_logf("ES9+ BPP parser: stage=%s err=%s/0x%08X httpBytes=%u b64Chars=%u derBytes=%u derOffset=%u state=%s header=%s segments=%u",
                          capture->scanner->failure_stage(),
@@ -2274,14 +2406,14 @@ static esp_err_t es9_bpp_http_event_handler(esp_http_client_event_t* event)
                          capture->scanner->parser_failure_state(),
                          bpp_header_summary(capture->scanner->parser_failure_header()).c_str(),
                          static_cast<unsigned>(capture->scanner->segment_count()));
-                if (!capture->scannerMessage || capture->scannerMessage->empty()) {
+                if (capture->scannerMessage->empty()) {
                     char detail[128];
                     snprintf(detail, sizeof(detail),
                              "ES9+ BPP 响应解析失败（err=%s/0x%08X，responseBytes=%u）",
                              esp_err_to_name(capture->scannerError),
                              static_cast<unsigned>(capture->scannerError),
                              static_cast<unsigned>(capture->responseBytes));
-                    capture->errorMessage = detail;
+                    *capture->scannerMessage = detail;
                 }
                 return capture->scannerError;
             }
@@ -2315,13 +2447,16 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
     capture.scanner = &scanner;
     capture.scannerMessage = &message;
     capture.allowMissingProtocol = allow_missing_protocol;
+    Es9Deadline deadline(kEs9BppTransactionTimeoutMs);
+    capture.deadline = &deadline;
     esp_http_client_config_t config = {};
     config.url = url.c_str();
-    config.timeout_ms = static_cast<int>(kEs9TimeoutMs);
+    config.timeout_ms = static_cast<int>(kEs9IoTimeoutMs);
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.skip_cert_common_name_check = false;
     config.keep_alive_enable = false;
     config.disable_auto_redirect = true;
+    config.is_async = true;
     config.buffer_size = 2048;
     config.buffer_size_tx = static_cast<int>(std::min<size_t>(32768U,
         std::max<size_t>(2048U, request_body.size() + 512U)));
@@ -2337,14 +2472,14 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
     if (err == ESP_OK) err = esp_http_client_set_header(client, "Content-Type", "application/json");
     if (err == ESP_OK) err = esp_http_client_set_header(client, "User-Agent", "gsma-rsp-lpad");
     if (err == ESP_OK) err = esp_http_client_set_header(client, "X-Admin-Protocol", "gsma/rsp/v2.7.0");
-    if (err == ESP_OK) err = esp_http_client_set_post_field(client, request_body.data(),
-                                                              request_body.size());
     if (err == ESP_OK) {
-        err = esp_http_client_perform(client);
+        err = es9_http_stream_request(client, request_body, deadline, &capture.scannerError);
     }
     const int status_code = esp_http_client_get_status_code(client);
     Es9HttpDiagnostics diagnostics;
-    if (err != ESP_OK) diagnostics = collect_es9_http_diagnostics(client);
+    if (err != ESP_OK && capture.scannerError == ESP_OK) {
+        diagnostics = collect_es9_http_diagnostics(client);
+    }
     const char* status_state = !scanner.status_seen()
         ? "missing"
         : (scanner.status() == "Executed-Success" ? "success" : "non-success");
@@ -2357,18 +2492,15 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
              static_cast<unsigned>(scanner.decoded_bpp_bytes()),
              static_cast<unsigned>(scanner.segment_count()),
              rsp_protocol_state(capture.adminProtocol, capture.adminProtocolSeen));
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        if (capture.scannerError != ESP_OK && capture.scannerMessage &&
-            !capture.scannerMessage->empty()) {
-            message = *capture.scannerMessage;
-        } else if (!capture.errorMessage.empty() && diagnostics.tlsError == ESP_OK &&
-                   diagnostics.transportErrno == 0) {
-            message = capture.errorMessage;
-        } else {
-            set_es9_http_error(message, "GetBPP", err, status_code, diagnostics);
+        if (capture.scannerError != ESP_OK) {
+            if (capture.scannerMessage->empty()) message = "ES9+ BPP 响应解析失败";
+            return capture.scannerError;
         }
+        set_es9_http_error(message, "GetBPP", err, status_code, diagnostics);
         return err;
     }
     if (status_code != 200) {
@@ -2376,18 +2508,6 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
         snprintf(buf, sizeof(buf), "ES9+ GetBPP HTTP 状态异常（%d）", status_code);
         message = buf;
         return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (capture.scannerError != ESP_OK) {
-        // esp_http_client 可能在回调返回错误后仍以 ESP_OK 结束；此时保留
-        // scanner 已写入的具体 Base64/DER/卡侧错误，不降级成笼统文本。
-        if (message.empty()) {
-            if (!capture.errorMessage.empty()) {
-                message = capture.errorMessage;
-            } else {
-                message = "ES9+ BPP 响应解析失败";
-            }
-        }
-        return capture.scannerError;
     }
     if (!check_rsp_protocol(capture.adminProtocol, capture.adminProtocolSeen,
                              allow_missing_protocol, "GetBPP", message)) {
