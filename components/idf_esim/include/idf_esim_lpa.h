@@ -23,6 +23,11 @@ esp_err_t idf_esim_lpa_prepare_download(const std::vector<uint8_t>& request,
                                         std::vector<uint8_t>& response,
                                         std::string& safe_message);
 
+// 检索 eUICC 中待发送的安装结果通知（BF2B/BF37），供 LPA 在下一次下载前恢复重发。
+esp_err_t idf_esim_lpa_retrieve_installation_notifications(
+    std::vector<std::vector<uint8_t>>& notifications,
+    std::string& safe_message);
+
 esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
                                            std::string& safe_message);
 

@@ -1118,6 +1118,70 @@ esp_err_t idf_esim_lpa_prepare_download(const std::vector<uint8_t>& request,
     return invoke_es10_raw(request, true, response, safe_message);
 }
 
+esp_err_t idf_esim_lpa_retrieve_installation_notifications(
+    std::vector<std::vector<uint8_t>>& notifications,
+    std::string& safe_message)
+{
+    notifications.clear();
+    // NotificationEvent 的 bit 0 表示 notificationInstall；DER BIT STRING 还包含
+    // 一个 unused-bits 字节，因此编码为 07 80。
+    static constexpr uint8_t TAG_RETRIEVE_NOTIFICATIONS[] = {0xBF, 0x2B};
+    static constexpr uint8_t TAG_OPERATION[] = {0x81};
+    static constexpr uint8_t TAG_NOTIFICATION_LIST[] = {0xA0};
+    static constexpr uint8_t TAG_INSTALLATION_RESULT[] = {0xBF, 0x37};
+    static constexpr uint8_t TAG_RESULT_ERROR[] = {0x81};
+    std::vector<uint8_t> body;
+    append_tlv(body, TAG_OPERATION, {0x07, 0x80});
+    std::vector<uint8_t> request;
+    append_tlv(request, TAG_RETRIEVE_NOTIFICATIONS, body);
+
+    std::vector<uint8_t> response;
+    esp_err_t err = invoke_es10_raw(request, true, response, safe_message);
+    if (err != ESP_OK) return err;
+
+    Tlv root;
+    if (!parse_tlv(response, root, safe_message) ||
+        !tag_is(root, TAG_RETRIEVE_NOTIFICATIONS)) {
+        notifications.clear();
+        safe_message = "RetrieveNotificationsList 响应 tag 无效";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (root.children.size() != 1U) {
+        notifications.clear();
+        safe_message = "RetrieveNotificationsList 响应 choice 无效";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const Tlv& choice = root.children.front();
+    if (tag_is(choice, TAG_RESULT_ERROR)) {
+        notifications.clear();
+        if (choice.value.size() == 1U && choice.value[0] == 127U) {
+            safe_message = "eUICC 无法检索待发送安装通知";
+        } else {
+            safe_message = "RetrieveNotificationsList 错误结果无效";
+        }
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!tag_is(choice, TAG_NOTIFICATION_LIST)) {
+        notifications.clear();
+        safe_message = "RetrieveNotificationsList 成功结果无效";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    for (const Tlv& notification : choice.children) {
+        if (!tag_is(notification, TAG_INSTALLATION_RESULT)) {
+            safe_message = "RetrieveNotificationsList 返回了非安装类通知";
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    notifications.reserve(choice.children.size());
+    for (const Tlv& notification : choice.children) {
+        std::vector<uint8_t> encoded;
+        append_tlv(encoded, notification.tag.data(), notification.tag.size(), notification.value);
+        notifications.push_back(std::move(encoded));
+    }
+    return ESP_OK;
+}
+
 esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
                                             std::string& safe_message)
 {
