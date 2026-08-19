@@ -2062,8 +2062,13 @@ private:
 
 class BppJsonStreamScanner {
 public:
-    BppJsonStreamScanner(BppStreamParser& parser, std::string& message)
-        : parser_(parser), decoder_(parser), message_(message) {}
+    BppJsonStreamScanner(BppStreamParser& parser,
+                         std::string& message,
+                         const std::string& expected_transaction_id)
+        : parser_(parser), decoder_(parser), message_(message)
+    {
+        expected_transaction_id_.text = expected_transaction_id;
+    }
 
     esp_err_t feed(const char* data, size_t length)
     {
@@ -2155,6 +2160,10 @@ private:
                 token_.push_back(ch);
             } else if (role_ == StringRole::value) {
                 if (current_key_ == "boundProfilePackage") {
+                    if (!bpp_metadata_validated_) {
+                        esp_err_t metadata_err = validate_bpp_metadata();
+                        if (metadata_err != ESP_OK) return metadata_err;
+                    }
                     const size_t decoded_before = parser_.input_bytes();
                     esp_err_t err = decoder_.feed(ch, message_);
                     if (err != ESP_OK) {
@@ -2214,8 +2223,10 @@ private:
             status_ = value_;
             status_seen_ = true;
         } else if (current_key_ == "transactionId") {
+            if (transaction_seen_) return fail("ES9+ BPP transactionId 重复");
             clear_string(transaction_id_.text);
             transaction_id_.text = value_;
+            transaction_seen_ = true;
         } else if (current_key_ == "boundProfilePackage") {
             esp_err_t err = decoder_.finish(message_);
             if (err != ESP_OK) {
@@ -2229,6 +2240,24 @@ private:
         return ESP_OK;
     }
 
+    esp_err_t validate_bpp_metadata()
+    {
+        if (!status_seen_ || status_ != "Executed-Success" || !transaction_seen_ ||
+            transaction_id_.text.empty()) {
+            return fail("ES9+ BPP 在响应状态和 transactionId 校验前出现");
+        }
+        std::vector<uint8_t> actual;
+        std::vector<uint8_t> expected;
+        std::string decode_message;
+        if (!decode_transaction_id(transaction_id_.text, actual, decode_message) ||
+            !decode_transaction_id(expected_transaction_id_.text, expected, decode_message) ||
+            actual != expected) {
+            return fail("ES9+ BPP transactionId 不匹配");
+        }
+        bpp_metadata_validated_ = true;
+        return ESP_OK;
+    }
+
     BppStreamParser& parser_;
     BppBase64Decoder decoder_;
     std::string& message_;
@@ -2238,13 +2267,16 @@ private:
     std::string value_;
     std::string status_;
     SensitiveText transaction_id_;
+    SensitiveText expected_transaction_id_;
     const char* failure_stage_ = "none";
     size_t response_bytes_ = 0;
     bool in_string_ = false;
     bool escape_ = false;
     bool awaiting_value_ = false;
     bool status_seen_ = false;
+    bool transaction_seen_ = false;
     bool bpp_seen_ = false;
+    bool bpp_metadata_validated_ = false;
     StringRole role_ = StringRole::none;
 };
 
@@ -2256,6 +2288,9 @@ struct Es9BppCapture {
     std::string errorMessage;
     esp_err_t scannerError = ESP_OK;
     size_t responseBytes = 0;
+    int statusCode = -1;
+    bool allowMissingProtocol = false;
+    bool bodyPreflightChecked = false;
 };
 
 static std::string bpp_header_summary(const std::vector<uint8_t>& bytes)
@@ -2276,13 +2311,32 @@ static esp_err_t es9_bpp_http_event_handler(esp_http_client_event_t* event)
 {
     if (!event || !event->user_data) return ESP_OK;
     auto* capture = static_cast<Es9BppCapture*>(event->user_data);
-    if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key) {
+    if (event->event_id == HTTP_EVENT_ON_STATUS_CODE && event->data &&
+        event->data_len >= static_cast<int>(sizeof(int))) {
+        capture->statusCode = *static_cast<const int*>(event->data);
+    } else if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key) {
         if (equal_ascii_ci(event->header_key, "X-Admin-Protocol")) {
             capture->adminProtocolSeen = true;
             capture->adminProtocol.assign(event->header_value ? event->header_value : "");
         }
     } else if (event->event_id == HTTP_EVENT_ON_DATA && event->data && event->data_len > 0) {
         const size_t length = static_cast<size_t>(event->data_len);
+        if (!capture->bodyPreflightChecked) {
+            capture->bodyPreflightChecked = true;
+            if (capture->statusCode != 200) {
+                capture->errorMessage = "ES9+ GetBPP HTTP 状态异常";
+                capture->scannerError = ESP_ERR_INVALID_RESPONSE;
+                return capture->scannerError;
+            }
+            std::string protocol_message;
+            if (!check_rsp_protocol(capture->adminProtocol, capture->adminProtocolSeen,
+                                    capture->allowMissingProtocol, "GetBPP", protocol_message)) {
+                capture->errorMessage = protocol_message;
+                capture->scannerError = ESP_ERR_INVALID_RESPONSE;
+                if (capture->scannerMessage) *capture->scannerMessage = protocol_message;
+                return capture->scannerError;
+            }
+        }
         if (capture->responseBytes > kMaxBppEncodedBytes + 64U * 1024U ||
             length > kMaxBppEncodedBytes + 64U * 1024U - capture->responseBytes) {
             capture->errorMessage = "ES9+ BPP 响应超过大小上限";
@@ -2346,6 +2400,7 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
     Es9BppCapture capture;
     capture.scanner = &scanner;
     capture.scannerMessage = &message;
+    capture.allowMissingProtocol = allow_missing_protocol;
     esp_http_client_config_t config = {};
     config.url = url.c_str();
     config.timeout_ms = static_cast<int>(kEs9TimeoutMs);
@@ -2965,7 +3020,7 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
 
     download_phase(observer, "get_bpp", "正在获取并写入 Profile");
     BppStreamParser bpp_parser;
-    BppJsonStreamScanner bpp_json(bpp_parser, safe_message);
+    BppJsonStreamScanner bpp_json(bpp_parser, safe_message, transaction_hex.text);
     SensitiveText response_transaction_id;
     err = es9_post_json_bpp(activation_code.smdpHost,
                             observer.allow_missing_admin_protocol,
