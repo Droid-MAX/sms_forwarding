@@ -1201,7 +1201,35 @@ esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
     std::vector<uint8_t> request;
     append_tlv(request, TAG_REMOVE_NOTIFICATION, body);
     std::vector<uint8_t> response;
-    return invoke_es10_raw(request, true, response, safe_message);
+    esp_err_t err = invoke_es10_raw(request, true, response, safe_message);
+    if (err != ESP_OK) return err;
+
+    // SW=9000 只表示 APDU 传输成功，还必须检查 BF30 的业务状态。
+    static constexpr uint8_t TAG_STATUS[] = {0x80};
+    Tlv root;
+    if (!parse_tlv(response, root, safe_message) ||
+        !tag_is(root, TAG_REMOVE_NOTIFICATION) ||
+        root.children.size() != 1U ||
+        !tag_is(root.children.front(), TAG_STATUS) ||
+        root.children.front().value.size() != 1U) {
+        safe_message = "RemoveNotificationFromList 响应无效";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    switch (root.children.front().value[0]) {
+        case 0x00:
+            return ESP_OK;
+        case 0x01:
+            // 服务器已确认通知，卡侧目标状态已满足；重复清理应保持幂等成功。
+            idf_log_line("eSIM 待处理安装通知已不在卡侧列表中");
+            return ESP_OK;
+        case 0x7F:
+            safe_message = "eUICC 删除待处理安装通知失败";
+            return ESP_FAIL;
+        default:
+            safe_message = "RemoveNotificationFromList 返回未知状态";
+            return ESP_ERR_INVALID_RESPONSE;
+    }
 }
 
 IdfEsimLpaBppSession::IdfEsimLpaBppSession() : impl_(nullptr) {}
