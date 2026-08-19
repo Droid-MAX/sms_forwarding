@@ -2350,6 +2350,16 @@ static void esim_task(void* arg_raw)
         observer.wait_confirmation_code = lpa_job_wait_confirmation;
         LpaDownloadStats stats;
         err = idf_lpa_run_profile_download(activation_code, observer, stats, message);
+        // 仅输出资源计数，便于真机比较不同 BPP；不包含任何下载凭据或协议载荷。
+        idf_logf("eSIM下载资源汇总: result=%s bppEncodedBytes=%u bppDecodedBytes=%u "
+                 "freeHeapAtStart=%u minimumFreeHeap=%u largestFreeBlock=%u freeHeapAtEnd=%u",
+                 err == ESP_OK ? "success" : esp_err_to_name(err),
+                 static_cast<unsigned>(stats.bppEncodedBytes),
+                 static_cast<unsigned>(stats.bppDecodedBytes),
+                 static_cast<unsigned>(stats.freeHeapAtStart),
+                 static_cast<unsigned>(stats.minimumFreeHeap),
+                 static_cast<unsigned>(stats.largestFreeBlock),
+                 static_cast<unsigned>(stats.freeHeapAtEnd));
         if (err == ESP_OK) {
             std::string refresh_message;
             err = idf_esim_list_profiles(profiles, eid, refresh_message);
