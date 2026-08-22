@@ -48,7 +48,29 @@
               <div><span class="dk">EID</span><div class="dv" id="esimEid">未读取</div></div>
               <div><span class="dk">最后刷新</span><div class="dv" id="esimUpdated">--</div></div>
             </div>
-            <div class="esim-actions"><button class="btn btn-primary" type="button" onclick="esimInfo()">查询 eSIM 信息</button><button class="btn btn-secondary" type="button" onclick="esimRefresh()">刷新配置列表</button></div>
+            <div class="esim-actions">
+              <button class="btn btn-primary" type="button" onclick="esimInfo()">查询 eSIM 信息</button>
+              <button class="btn btn-secondary" type="button" onclick="esimRefresh()">刷新配置列表</button></div>
+            <div class="esim-install-box">
+              <div class="form-group">
+                <label class="form-label" for="esimActivationCode">手工输入 Activation Code</label>
+                <input class="form-input" type="text" id="esimActivationCode" maxlength="516" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="LPA:1$SM-DP+ 地址$MatchingID">
+              </div>
+              <div class="esim-install-preview">
+                <div><span class="dk">SM-DP+ 主机</span><div class="dv" id="esimInstallHost">--</div></div>
+                <div><span class="dk">MatchingID（脱敏）</span><div class="dv" id="esimInstallMatchingId">--</div></div>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-primary" type="button" id="esimInstallStartBtn" onclick="esimInstallStart()">开始下载</button>
+                <label class="switch-row" style="margin-left:12px;"><span class="switch-text">兼容模式</span><input type="checkbox" class="switch-input" id="esimEs9CompatMode"><span class="switch-slider"></span></label>
+              </div>
+              <p class="form-hint">兼容模式允许服务端缺少 X-Admin-Protocol 响应头</p>
+              <div id="esimConfirmationBox" style="display:none">
+                <div class="form-group"><label class="form-label" for="esimConfirmationCode">Confirmation Code</label><input class="form-input" type="password" id="esimConfirmationCode" maxlength="64" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+                <button class="btn btn-secondary" type="button" id="esimConfirmationSubmitBtn" onclick="esimInstallSubmitConfirmation()" disabled>提交</button>
+              </div>
+              <div class="result-box result-info" id="esimInstallStatus">尚未提交下载任务</div>
+            </div>
             <div class="esim-table-wrap">
               <table class="esim-table">
                 <thead><tr><th>ICCID</th><th>昵称</th><th>状态</th><th>操作</th></tr></thead>

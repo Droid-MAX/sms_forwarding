@@ -11,11 +11,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$BuildDir = Join-Path $RepoRoot 'build\idf'
-$SdkConfig = Join-Path $RepoRoot 'build\sdkconfig'
+$BuildDir = Join-Path $RepoRoot 'build\idf6'
+$SdkConfig = Join-Path $RepoRoot 'build\sdkconfig.idf6'
 
 if ([string]::IsNullOrWhiteSpace($IdfPath)) {
-    $IdfPath = 'E:\Espressif\esp-idf-v5.5.4'
+    $IdfPath = 'E:\Espressif\esp-idf-v6.0.2'
 }
 if ([string]::IsNullOrWhiteSpace($IdfToolsPath)) {
     $IdfToolsPath = 'E:\Espressif\.espressif'
@@ -30,6 +30,9 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
 $env:IDF_TOOLS_PATH = $IdfToolsPath
 . $ExportScript
+
+# 在外部 ESP-IDF 源码上应用项目维护的兼容 patch；由 git apply 严格检查上下文。
+python (Join-Path $RepoRoot 'tools\apply_idf_patches.py') --idf-path $IdfPath
 
 $IdfArgs = @('-B', $BuildDir, '-D', "SDKCONFIG=$SdkConfig")
 
