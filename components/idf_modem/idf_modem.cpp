@@ -22,6 +22,8 @@
 #include "idf_log.h"
 #include "idf_util.h"
 #include "nvs.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 
 static const char* TAG = "idf_modem";
 
@@ -1074,7 +1076,7 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
 {
     std::string url = idf_util_trim_copy(raw_url);
     if (url.empty()) url = IDF_KEEPALIVE_DEFAULT_URL;
-    if (url.size() > 240) {
+    if (url.size() > 2048) {
         error = "蜂窝HTTP URL过长";
         return false;
     }
@@ -1174,6 +1176,26 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
     return ret;
 }
 
+static bool send_at_data_locked(const std::string& cmd, const std::string& data, std::string& response)
+{
+    if (send_at_locked(cmd, 3000, response) != ESP_OK) return false;
+    if (uart_write_bytes(MODEM_UART, data.data(), data.size()) != static_cast<int>(data.size())) return false;
+
+    response.clear();
+    TickDeadline deadline(5000);
+    uint8_t buf[128];
+    while (!deadline.expired()) {
+        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(80));
+        if (got <= 0) continue;
+        preserve_uart_urcs(buf, static_cast<size_t>(got));
+        response.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
+        int final_code = at_final_result(response);
+        if (final_code != 0) return final_code > 0;
+        if (response.size() > 512) response.erase(0, response.size() - 512);
+    }
+    return false;
+}
+
 static int parse_mhttp_create_id(const std::string& resp)
 {
     size_t p = resp.find("+MHTTPCREATE:");
@@ -1252,7 +1274,8 @@ static void append_sms_urc_line(const std::string& line)
     append_urc_text(text);
 }
 
-static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCellularHttpResult& result)
+static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_t min_bytes,
+                                       IdfCellularHttpResult& result)
 {
     TickDeadline deadline(timeout_ms);
     std::string head;
@@ -1284,15 +1307,14 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
                         append_sms_urc_line(line);
                         append_next_sms_payload = starts_with(line, "+CMT:");
                     } else if (line == "RING" || starts_with(line, "+CLIP:")) {
-                        // 保号下载最长可占用 UART ~90s，整段响铃都可能落在窗口内；
-                        // 不转发这两类行来电通知就静默丢了
+                        // 蜂窝请求最长可占用 UART ~90s，期间仍须保留短信与来电 URC。
                         append_sms_urc_line(line);
                     }
                 }
                 head.clear();
                 continue;
             }
-            if (head.size() < 620) head += ch;  // 需容纳下载中途插入的最大 PDU 行(~600 hex 字符)
+            if (head.size() < 620) head += ch;
 
             int need_commas = 0;
             if (starts_with(head, "+MHTTPURC: \"content\"")) need_commas = 5;
@@ -1305,44 +1327,39 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
         }
     }
 
-    if (!complete) idf_log_line("蜂窝HTTP下载等待超时");
+    if (!complete) idf_log_line("蜂窝HTTP响应等待超时");
     return !error && complete && result.httpStatus >= 200 && result.httpStatus < 400 &&
-           result.bytesRead >= CELLULAR_KEEPALIVE_MIN_BYTES;
+           result.bytesRead >= min_bytes;
 }
 
-static bool valid_ipv4_address(const std::string& value)
+static bool valid_ip_address(const std::string& value)
 {
-    int parts = 0;
-    size_t pos = 0;
-    bool non_zero = false;
-    while (pos <= value.size() && parts < 4) {
-        size_t dot = value.find('.', pos);
-        std::string part = value.substr(pos, dot == std::string::npos ? std::string::npos : dot - pos);
-        if (part.empty() || part.size() > 3) return false;
-        if (part.size() > 1 && part[0] == '0') return false;
-        long octet = -1;
-        if (!parse_long_token(part, octet) || octet < 0 || octet > 255) return false;
-        if (octet != 0) non_zero = true;
-        ++parts;
-        if (dot == std::string::npos) break;
-        if (parts >= 4) return false;
-        pos = dot + 1;
-    }
-    return parts == 4 && non_zero;
+    uint8_t address[16] = {};
+    int family = value.find(':') == std::string::npos ? AF_INET : AF_INET6;
+    if (inet_pton(family, value.c_str(), address) != 1) return false;
+    size_t size = family == AF_INET ? 4 : 16;
+    return std::any_of(address, address + size, [](uint8_t byte) { return byte != 0; });
 }
 
 static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
 {
     size_t p = resp.find("+CGPADDR:");
     if (p == std::string::npos) return false;
-    size_t comma = resp.find(',', p);
     size_t eol = resp.find('\n', p);
     if (eol == std::string::npos) eol = resp.size();
-    if (comma == std::string::npos || comma >= eol) return false;
-    ip = idf_util_trim_copy(resp.substr(comma + 1, eol - comma - 1));
-    ip.erase(std::remove(ip.begin(), ip.end(), '"'), ip.end());
-    if (!valid_ipv4_address(ip)) return false;
-    return true;
+    p = resp.find(',', p);
+    while (p != std::string::npos && p < eol) {
+        size_t next = resp.find(',', p + 1);
+        if (next == std::string::npos || next > eol) next = eol;
+        std::string candidate = idf_util_trim_copy(resp.substr(p + 1, next - p - 1));
+        candidate.erase(std::remove(candidate.begin(), candidate.end(), '"'), candidate.end());
+        if (valid_ip_address(candidate)) {
+            ip = candidate;
+            return true;
+        }
+        p = next < eol ? next : std::string::npos;
+    }
+    return false;
 }
 
 static bool apn_valid_for_at(const std::string& apn)
@@ -1505,9 +1522,9 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
         } else if (!apn.empty()) {
             idf_log_line("APN 包含非法字符，启动时未下发 CGDCONT");
         }
-        bool ok = send_ok("AT+CGACT=1,1", active_timeout_ms, &resp);
-        if (ok) sample_cell_ip_once();
-        return ok;
+        send_ok("AT+CGACT=1,1", active_timeout_ms, &resp);
+        // 已激活的 PDP 在部分固件上会对重复 CGACT 返回 ERROR；实际拿到 IP 才算可用。
+        return sample_cell_ip_once();
     }
 
     bool ok = send_ok("AT+CGACT=0,1", inactive_timeout_ms, &resp);
@@ -1605,7 +1622,9 @@ static bool process_data_mode_retry(void)
 }
 
 static bool fetch_mhttp_once_locked(const std::string& protocol, const std::string& host,
-                                    const std::string& path, IdfCellularHttpResult& result)
+                                    const std::string& path, const char* method,
+                                    const char* content_type, const std::string& body,
+                                    uint32_t min_response_bytes, IdfCellularHttpResult& result)
 {
     for (int i = 0; i < 4; ++i) {
         std::string ignored;
@@ -1614,11 +1633,7 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
         send_at_locked(cmd, 1000, ignored, 256, 10);
     }
 
-    std::string create_cmd = "AT+MHTTPCREATE=\"";
-    create_cmd += protocol;
-    create_cmd += "://";
-    create_cmd += host;
-    create_cmd += "\"";
+    std::string create_cmd = "AT+MHTTPCREATE=\"" + protocol + "://" + host + "\"";
     std::string resp;
     if (send_at_locked(create_cmd, 10000, resp, 1600, 1200) != ESP_OK) {
         result.message = "蜂窝HTTP创建失败";
@@ -1629,7 +1644,6 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     int http_id = parse_mhttp_create_id(resp);
     if (http_id < 0) {
         result.message = "蜂窝HTTP创建失败：未返回连接ID";
-        idf_logf("蜂窝HTTP创建失败: %s", resp.c_str());
         return false;
     }
 
@@ -1640,117 +1654,136 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     }
     snprintf(cmd, sizeof(cmd), "AT+MHTTPCFG=\"encoding\",%d,0,0", http_id);
     send_at_locked(cmd, 3000, resp);
-    send_mhttp_header_locked(http_id, true, "Cache-Control: no-cache, no-store, must-revalidate");
-    send_mhttp_header_locked(http_id, false, "Pragma: no-cache");
+    if (min_response_bytes > 0) {
+        send_mhttp_header_locked(http_id, true, "Cache-Control: no-cache, no-store, must-revalidate");
+        send_mhttp_header_locked(http_id, false, "Pragma: no-cache");
+    } else if (content_type && *content_type) {
+        send_mhttp_header_locked(http_id, false, std::string("Content-Type: ") + content_type);
+    }
+
+    int method_value = strcmp(method, "POST") == 0 ? 2 : 1;
+    if (method_value == 2 && !body.empty()) {
+        snprintf(cmd, sizeof(cmd), "AT+MHTTPCONTENT=%d,0,%u", http_id,
+                 static_cast<unsigned>(body.size()));
+        if (!send_at_data_locked(cmd, body, resp)) {
+            result.message = "蜂窝HTTP请求正文发送失败";
+            snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
+            send_at_locked(cmd, 2000, resp, 256, 20);
+            return false;
+        }
+    }
+
     snprintf(cmd, sizeof(cmd), "AT+MHTTPCFG=\"encoding\",%d,1,1", http_id);
     send_at_locked(cmd, 3000, resp);
-
-    std::string request_cmd = "AT+MHTTPREQUEST=";
-    request_cmd += std::to_string(http_id);
-    request_cmd += ",1,0,";
-    request_cmd += hex_encode_ascii(path);
+    std::string request_cmd = "AT+MHTTPREQUEST=" + std::to_string(http_id) + "," +
+                              std::to_string(method_value) + ",0," + hex_encode_ascii(path);
     if (send_at_locked(request_cmd, 10000, resp) != ESP_OK) {
         result.message = "蜂窝HTTP请求发送失败";
-        idf_logf("蜂窝HTTP请求发送失败: %s", resp.c_str());
         snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
         send_at_locked(cmd, 2000, resp, 256, 20);
         return false;
     }
 
-    bool ok = wait_mhttp_download_locked(http_id, CELLULAR_HTTP_TIMEOUT_MS, result);
+    bool ok = wait_mhttp_download_locked(http_id, CELLULAR_HTTP_TIMEOUT_MS,
+                                         min_response_bytes, result);
     snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
     send_at_locked(cmd, 3000, resp, 256, 20);
-    if (ok) {
-        result.message = "蜂窝HTTP payload 下载完成";
-        idf_logf("蜂窝HTTP保号完成: HTTP %d, 已下载约 %uKB",
-                 result.httpStatus, static_cast<unsigned>(result.bytesRead / 1024UL));
-    } else {
-        if (result.message.empty()) result.message = "蜂窝HTTP payload 下载失败";
-        idf_logf("蜂窝HTTP保号失败: HTTP %d, 已下载约 %uKB/期望%uKB",
-                 result.httpStatus,
-                 static_cast<unsigned>(result.bytesRead / 1024UL),
-                 static_cast<unsigned>(result.expectedBytes / 1024UL));
-    }
     result.ok = ok;
+    if (result.message.empty()) result.message = ok ? "蜂窝HTTP请求完成" : "蜂窝HTTP请求失败";
     return ok;
 }
 
-esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config,
-                                      IdfCellularHttpResult& result)
+static esp_err_t cellular_http_request_impl(const std::string& url, const char* method,
+                                            const char* content_type, const std::string& body,
+                                            const IdfCellularHttpConfig& config,
+                                            uint32_t min_response_bytes, bool keepalive,
+                                            IdfCellularHttpResult& result)
 {
     result = IdfCellularHttpResult();
     if (!s_started) {
         result.message = "模组尚未启动";
         return ESP_ERR_INVALID_STATE;
     }
+    if (!method || (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0) ||
+        body.size() > 4096 ||
+        (content_type && (strchr(content_type, '\r') || strchr(content_type, '\n')))) {
+        result.message = "蜂窝HTTP请求参数无效";
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!keepalive && !config.dataEnabled) {
+        result.message = "蜂窝数据未启用";
+        return ESP_ERR_INVALID_STATE;
+    }
 
     std::string protocol;
     std::string host;
     std::string path;
-    if (!parse_http_url(url, protocol, host, path, result.message)) {
-        return ESP_ERR_INVALID_ARG;
+    if (!parse_http_url(url, protocol, host, path, result.message)) return ESP_ERR_INVALID_ARG;
+    if (keepalive) {
+        normalize_keepalive_payload_size(host, path);
+        append_no_cache_query(path);
     }
-    normalize_keepalive_payload_size(host, path);
-    append_no_cache_query(path);
 
-    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(CELLULAR_HTTP_TIMEOUT_MS + 45000UL)) != pdTRUE) {
+    if (xSemaphoreTakeRecursive(s_at_mutex,
+                                pdMS_TO_TICKS(CELLULAR_HTTP_TIMEOUT_MS + 45000UL)) != pdTRUE) {
         result.message = "模组串口忙，蜂窝HTTP未执行";
         return ESP_ERR_TIMEOUT;
     }
 
-    idf_logf("准备通过蜂窝HTTP下载payload: %s://%s%s",
-             protocol.c_str(), host.c_str(), path.c_str());
-
+    idf_logf("蜂窝HTTP请求: %s %s://%s", method, protocol.c_str(), host.c_str());
     std::string resp;
     std::string apn = idf_util_trim_copy(config.apn);
-    if (!apn.empty() && apn.find('"') == std::string::npos) {
-        std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
-        cmd += apn;
-        cmd += "\"";
+    if (!apn.empty() && apn_valid_for_at(apn)) {
+        std::string cmd = "AT+CGDCONT=1,\"IP\",\"" + apn + "\"";
         send_at_locked(cmd, 3000, resp);
     }
 
-    idf_log_line("激活数据连接(CGACT)...");
-    esp_err_t activate_err = send_at_locked("AT+CGACT=1,1", 10000, resp);
-    if (activate_err != ESP_OK) {
-        idf_logf("CGACT激活未返回OK，继续等待PDP: %s", resp.c_str());
+    if (send_at_locked("AT+CGACT=1,1", 10000, resp) != ESP_OK) {
+        idf_log_line("CGACT激活未返回OK，继续检查PDP地址");
     }
-
     std::string ip;
-    bool pdp_ready = wait_pdp_ready_locked(CELLULAR_PDP_READY_TIMEOUT_MS, ip);
-    if (!pdp_ready) {
+    if (!wait_pdp_ready_locked(CELLULAR_PDP_READY_TIMEOUT_MS, ip)) {
         set_status_cell_ip("");
-        if (!config.dataEnabled) {
-            idf_log_line("关闭PDP上下文(CGACT=0)...");
-            send_at_locked("AT+CGACT=0,1", 5000, resp);
-        }
+        if (!config.dataEnabled) send_at_locked("AT+CGACT=0,1", 5000, resp);
         xSemaphoreGiveRecursive(s_at_mutex);
         result.message = "蜂窝PDP未取得有效IP，请查看日志";
         return ESP_FAIL;
     }
     result.cellIp = ip;
 
-    bool ok = fetch_mhttp_once_locked(protocol, host, path, result);
-    if (!ok && protocol == "https" && result.mhttpError == 4) {
-        idf_log_line("HTTPS握手失败，改用HTTP重试一次；若返回301，请关闭强制HTTPS跳转");
+    bool ok = fetch_mhttp_once_locked(protocol, host, path, method, content_type, body,
+                                      min_response_bytes, result);
+    if (keepalive && !ok && protocol == "https" && result.mhttpError == 4) {
+        idf_log_line("保号HTTPS握手失败，改用HTTP重试一次");
         IdfCellularHttpResult retry;
         retry.cellIp = result.cellIp;
-        ok = fetch_mhttp_once_locked("http", host, path, retry);
+        ok = fetch_mhttp_once_locked("http", host, path, method, content_type, body,
+                                     min_response_bytes, retry);
         result = retry;
     }
 
     if (!config.dataEnabled) {
-        idf_log_line("关闭PDP上下文(CGACT=0)...");
         send_at_locked("AT+CGACT=0,1", 5000, resp);
         set_status_cell_ip("");
-    }
-
-    if (result.message.empty()) {
-        result.message = ok ? "蜂窝HTTP payload 下载完成" : "蜂窝HTTP payload 下载失败，请查看日志";
     }
     result.ok = ok;
     xSemaphoreGiveRecursive(s_at_mutex);
     return ok ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config,
+                                      IdfCellularHttpResult& result)
+{
+    return cellular_http_request_impl(url, "GET", nullptr, std::string(), config,
+                                      CELLULAR_KEEPALIVE_MIN_BYTES, true, result);
+}
+
+esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* method,
+                                           const char* content_type, const std::string& body,
+                                           const IdfCellularHttpConfig& config,
+                                           IdfCellularHttpResult& result)
+{
+    return cellular_http_request_impl(url, method, content_type, body, config, 0, false, result);
 }
 
 static void sample_signal_once(void)
@@ -2288,6 +2321,7 @@ static void modem_task(void*)
     TickType_t last_identity = 0;
     TickType_t last_detail = 0;
     TickType_t last_health = 0;
+    TickType_t last_cell_ip = 0;
     int health_fail_count = 0;
     int dereg_count = 0;
     TickType_t last_sim_check = 0;
@@ -2308,6 +2342,7 @@ static void modem_task(void*)
             health_fail_count = 0;
             dereg_count = 0;
             last_health = 0;
+            last_cell_ip = 0;
             last_sim_check = now;  // 给 SIM 上电初始化留出一个完整检测周期
             sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
             sim_present = -1;
@@ -2345,6 +2380,13 @@ static void modem_task(void*)
         if (sim_ready && (web_active || startup_sampling) && at_channel_idle_now()) {
             if (force_sample) {
                 s_status_sample_requests.store(0, std::memory_order_relaxed);
+            }
+            const IdfSimSettingsView sim_cfg = idf_config_get_sim_settings_view();
+            if (sim_cfg.dataEnabled && idf_modem_get_status().cellIp.empty() &&
+                (last_cell_ip == 0 ||
+                 now - last_cell_ip > pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS))) {
+                sample_cell_ip_once();
+                last_cell_ip = now;
             }
             if (startup_sampling || force_sample || last_signal == 0 ||
                 now - last_signal > pdMS_TO_TICKS(SIGNAL_INTERVAL_WEB_MS)) {

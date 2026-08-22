@@ -662,17 +662,34 @@ static uint32_t backoff_seconds(uint8_t attempts, uint32_t seed)
     return step + (jitter ? (seed % (jitter + 1)) : 0);
 }
 
+static bool http_transport_available()
+{
+    if (idf_wifi_get_status().staConnected) return true;
+    const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
+    return sim.dataEnabled && idf_modem_get_status().modemReady;
+}
+
 static esp_err_t http_request(const std::string& url, const char* method,
                               const char* content_type, const std::string& body,
                               int& status_code)
 {
+    if (!idf_wifi_get_status().staConnected) {
+        const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
+        IdfCellularHttpConfig cfg;
+        cfg.dataEnabled = sim.dataEnabled;
+        cfg.apn = sim.apn;
+        IdfCellularHttpResult result;
+        esp_err_t err = idf_modem_cellular_http_request(url, method, content_type, body, cfg, result);
+        status_code = result.httpStatus;
+        return err;
+    }
+
     esp_http_client_config_t cfg = {};
     cfg.url = url.c_str();
     cfg.timeout_ms = HTTP_TIMEOUT_MS;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.keep_alive_enable = false;
-    // 默认 TX 缓冲 512B 放不下长短信的 GET 请求行(百分号编码后可达 1.4KB+)；
-    // 长合并短信(中文×百分号编码可膨胀 9 倍)按实际 URL 长度放宽，避免必败重试
+    // 默认 TX 缓冲 512B 放不下长短信的 GET 请求行(百分号编码后可达 1.4KB+)。
     size_t tx_need = url.size() + 512;
     cfg.buffer_size_tx = static_cast<int>(tx_need < 2048 ? 2048 : tx_need);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -1648,8 +1665,8 @@ static bool low_heap_defer()
 
 static bool process_push_one()
 {
-    if (!idf_wifi_get_status().staConnected) return false;
-    if (low_heap_defer()) return false;  // 任务留在队列里，等堆恢复再发
+    if (!http_transport_available()) return false;
+    if (idf_wifi_get_status().staConnected && low_heap_defer()) return false;
     int picked = -1;
     PushJob job;
     int64_t now = esp_timer_get_time();
@@ -1795,8 +1812,8 @@ static bool process_email_one()
 
 static bool process_test_one()
 {
-    if (!idf_wifi_get_status().staConnected) return false;
-    if (low_heap_defer()) return false;
+    if (!http_transport_available()) return false;
+    if (idf_wifi_get_status().staConnected && low_heap_defer()) return false;
     int picked = -1;
     IdfPushChannel channel;
     const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
@@ -1966,8 +1983,8 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         message = "通道序号无效";
         return false;
     }
-    if (!idf_wifi_get_status().staConnected) {
-        message = "WiFi 未连接，暂不能测试推送";
+    if (!http_transport_available()) {
+        message = "WiFi 未连接且蜂窝数据不可用，暂不能测试推送";
         return false;
     }
     if (!ensure_init()) {

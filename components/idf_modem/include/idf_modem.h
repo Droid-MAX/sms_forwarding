@@ -55,6 +55,10 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
+esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* method,
+                                           const char* content_type, const std::string& body,
+                                           const IdfCellularHttpConfig& config,
+                                           IdfCellularHttpResult& result);
 esp_err_t idf_modem_request_reset(bool hard_reset);
 // 请求模组任务重新检查 SIM 锁；allow_puk=true 仅用于网页二次确认后的单次 PUK 操作。
 esp_err_t idf_modem_request_sim_unlock(bool allow_puk);

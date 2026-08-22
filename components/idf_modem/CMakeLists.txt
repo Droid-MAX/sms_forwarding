@@ -8,4 +8,5 @@ idf_component_register(
     idf_config
     idf_logbuf
     nvs_flash
+    lwip
 )
