@@ -41,7 +41,21 @@ static constexpr uint32_t CELLULAR_HTTP_TIMEOUT_MS = 90000UL;
 static constexpr uint32_t CELLULAR_PDP_READY_TIMEOUT_MS = 12000UL;
 static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000UL;
 static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
-static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
+// SIM 锁状态与身份字段首次缺失时快速补采，连续无变化后逐步退避；既照顾启动较慢的卡，
+// 也避免不支持 ICCID/COPS/CNUM 等命令的卡长期高频占用 AT 通道。
+static constexpr uint32_t MODEM_RETRY_DELAYS_MS[] = {
+    30000UL, 60000UL, 120000UL, 300000UL, 600000UL,
+};
+static constexpr size_t MODEM_RETRY_DELAY_COUNT =
+    sizeof(MODEM_RETRY_DELAYS_MS) / sizeof(MODEM_RETRY_DELAYS_MS[0]);
+
+static constexpr uint32_t modem_retry_delay_ms(uint8_t level)
+{
+    size_t index = level < MODEM_RETRY_DELAY_COUNT ? level : MODEM_RETRY_DELAY_COUNT - 1;
+    return MODEM_RETRY_DELAYS_MS[index];
+}
+static_assert(modem_retry_delay_ms(0) == 30000UL, "首次补采应在 30 秒后执行");
+static_assert(modem_retry_delay_ms(99) == 600000UL, "补采退避上限应为 10 分钟");
 // 用户显式刷新概览模组信息后才做展示型采样：启动期不主动读取身份/信号；
 // 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
@@ -2277,6 +2291,8 @@ static void modem_task(void*)
     idf_log_line("模组 AT 已就绪");
 
     bool sim_ready = try_unlock_sim(false);
+    TickType_t last_sim_unlock_check = xTaskGetTickCount();
+    uint8_t sim_unlock_retry_level = 0;
     if (sim_ready) {
         configure_sms_and_registration();
         set_phase("registering");
@@ -2299,8 +2315,10 @@ static void modem_task(void*)
     }
     bool registered = (stat == 1 || stat == 5);
     bool post_register_done = false;
+    TickType_t last_identity = 0;
+    uint8_t identity_retry_level = 0;
     if (!sim_ready) {
-        // 锁卡/无卡状态由 try_unlock_sim 写入，等待热插拔或网页更新凭据。
+        // 锁卡/无卡状态由 try_unlock_sim 写入，后台按退避间隔重查。
     } else if (!registered) {
         set_phase("failed");
     } else {
@@ -2313,12 +2331,12 @@ static void modem_task(void*)
         sample_signal_once();
         sample_signal_detail_once();
         sample_identity_once(false, true);
+        last_identity = xTaskGetTickCount();
         post_register_done = startup_sampling_done();
         set_phase(post_register_done ? "ready" : "sampling");
     }
 
     TickType_t last_signal = 0;
-    TickType_t last_identity = 0;
     TickType_t last_detail = 0;
     TickType_t last_health = 0;
     TickType_t last_cell_ip = 0;
@@ -2343,28 +2361,51 @@ static void modem_task(void*)
             dereg_count = 0;
             last_health = 0;
             last_cell_ip = 0;
+            last_identity = 0;
+            identity_retry_level = 0;
+            last_sim_unlock_check = now;
+            sim_unlock_retry_level = 0;
             last_sim_check = now;  // 给 SIM 上电初始化留出一个完整检测周期
             sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
             sim_present = -1;
             sms_reconfigure_pending = true;
         }
         int unlock_request = s_sim_unlock_request.exchange(0, std::memory_order_relaxed);
+        bool sim_unlock_checked = false;
         if (unlock_request != 0) {
             if (!at_channel_idle_now()) {
                 s_sim_unlock_request.store(unlock_request, std::memory_order_relaxed);
             } else {
                 if (unlock_request == 1) s_last_pin_attempt_key.clear();
                 sim_ready = try_unlock_sim(unlock_request == 2);
+                sim_unlock_checked = true;
+                last_sim_unlock_check = now;
+                sim_unlock_retry_level = 0;
             }
-            if (sim_ready && at_channel_idle_now()) {
-                configure_sms_and_registration();
-                set_phase("registering");
-                apply_startup_data_mode();
-                registered = false;
-                post_register_done = false;
-                sms_reconfigure_pending = true;
-                last_health = 0;
+        }
+        bool sim_unlock_retry_due = !sim_ready &&
+                                    now - last_sim_unlock_check >= pdMS_TO_TICKS(
+                                        modem_retry_delay_ms(sim_unlock_retry_level));
+        if (!sim_unlock_checked && sim_unlock_retry_due && at_channel_idle_now()) {
+            sim_ready = try_unlock_sim(false);
+            sim_unlock_checked = true;
+            last_sim_unlock_check = now;
+            if (sim_ready) {
+                sim_unlock_retry_level = 0;
+            } else if (sim_unlock_retry_level + 1 < MODEM_RETRY_DELAY_COUNT) {
+                ++sim_unlock_retry_level;
             }
+        }
+        if (sim_unlock_checked && sim_ready && at_channel_idle_now()) {
+            configure_sms_and_registration();
+            set_phase("registering");
+            apply_startup_data_mode();
+            registered = false;
+            post_register_done = false;
+            last_identity = 0;
+            identity_retry_level = 0;
+            sms_reconfigure_pending = true;
+            last_health = 0;
         }
         if (!sim_ready) s_status_sample_requests.store(0, std::memory_order_relaxed);
         if (process_data_mode_retry()) {
@@ -2377,7 +2418,11 @@ static void modem_task(void*)
                           (esp_timer_get_time() -
                            s_last_web_poll_us.load(std::memory_order_relaxed)) < WEB_POLL_ACTIVE_WINDOW_US;
         bool startup_sampling = registered && !post_register_done;
-        if (sim_ready && (web_active || startup_sampling) && at_channel_idle_now()) {
+        bool identity_retry_due = !startup_info_complete() &&
+                                  (last_identity == 0 ||
+                                   now - last_identity >= pdMS_TO_TICKS(
+                                       modem_retry_delay_ms(identity_retry_level)));
+        if (sim_ready && (web_active || startup_sampling || identity_retry_due) && at_channel_idle_now()) {
             if (force_sample) {
                 s_status_sample_requests.store(0, std::memory_order_relaxed);
             }
@@ -2398,11 +2443,14 @@ static void modem_task(void*)
                 sample_signal_detail_once();
                 last_detail = now;
             }
-            if ((startup_sampling || force_sample || !startup_info_complete()) &&
-                (startup_sampling || force_sample || last_identity == 0 ||
-                 now - last_identity > pdMS_TO_TICKS(IDENTITY_RETRY_INTERVAL_MS))) {
-                sample_identity_once(false, true);
+            if (startup_sampling || force_sample || identity_retry_due) {
+                bool identity_changed = sample_identity_once(false, true);
                 last_identity = now;
+                if (startup_info_complete() || identity_changed) {
+                    identity_retry_level = 0;
+                } else if (identity_retry_level + 1 < MODEM_RETRY_DELAY_COUNT) {
+                    ++identity_retry_level;
+                }
             }
             if (startup_sampling && startup_sampling_done()) {
                 set_phase("ready");
@@ -2449,6 +2497,8 @@ static void modem_task(void*)
                         sample_signal_once();
                         sample_signal_detail_once();
                         sample_identity_once(false, true);
+                        last_identity = now;
+                        identity_retry_level = 0;
                         post_register_done = startup_sampling_done();
                         set_phase(post_register_done ? "ready" : "sampling");
                     }
