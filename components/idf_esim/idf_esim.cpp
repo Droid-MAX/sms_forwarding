@@ -1118,67 +1118,62 @@ esp_err_t idf_esim_lpa_prepare_download(const std::vector<uint8_t>& request,
     return invoke_es10_raw(request, true, response, safe_message);
 }
 
-esp_err_t idf_esim_lpa_retrieve_installation_notifications(
-    std::vector<std::vector<uint8_t>>& notifications,
+esp_err_t idf_esim_lpa_retrieve_notifications(
+    std::vector<uint8_t>& encoded_response,
+    size_t& list_offset,
+    size_t& list_length,
     std::string& safe_message)
 {
-    notifications.clear();
-    // NotificationEvent 的 bit 0 表示 notificationInstall；DER BIT STRING 还包含
-    // 一个 unused-bits 字节，因此编码为 07 80。
+    encoded_response.clear();
+    list_offset = 0;
+    list_length = 0;
     static constexpr uint8_t TAG_RETRIEVE_NOTIFICATIONS[] = {0xBF, 0x2B};
-    static constexpr uint8_t TAG_OPERATION[] = {0x81};
     static constexpr uint8_t TAG_NOTIFICATION_LIST[] = {0xA0};
-    static constexpr uint8_t TAG_INSTALLATION_RESULT[] = {0xBF, 0x37};
     static constexpr uint8_t TAG_RESULT_ERROR[] = {0x81};
-    std::vector<uint8_t> body;
-    append_tlv(body, TAG_OPERATION, {0x07, 0x80});
-    std::vector<uint8_t> request;
-    append_tlv(request, TAG_RETRIEVE_NOTIFICATIONS, body);
+    // searchCriteria 在 SGP.22 中为 OPTIONAL。直接省略可同时覆盖全部标准通知，
+    // 也兼容拒绝 operation/sequence 筛选、但支持无条件检索的 eUICC。
+    std::vector<uint8_t> request = {0xBF, 0x2B, 0x00};
 
-    std::vector<uint8_t> response;
-    esp_err_t err = invoke_es10_raw(request, true, response, safe_message);
+    esp_err_t err = invoke_es10_raw(request, true, encoded_response, safe_message);
     if (err != ESP_OK) return err;
 
-    Tlv root;
-    if (!parse_tlv(response, root, safe_message) ||
-        !tag_is(root, TAG_RETRIEVE_NOTIFICATIONS)) {
-        notifications.clear();
+    size_t pos = 0;
+    idf_esim_internal::TlvSpan root;
+    if (!idf_esim_internal::parse_tlv_span(
+            encoded_response, encoded_response.size(), pos, root, safe_message) ||
+        pos != encoded_response.size() ||
+        !idf_esim_internal::tag_is(encoded_response, root, TAG_RETRIEVE_NOTIFICATIONS)) {
+        encoded_response.clear();
         safe_message = "RetrieveNotificationsList 响应 tag 无效";
         return ESP_ERR_INVALID_RESPONSE;
     }
-    if (root.children.size() != 1U) {
-        notifications.clear();
+
+    pos = root.valueOffset;
+    const size_t root_end = root.valueOffset + root.valueLength;
+    idf_esim_internal::TlvSpan choice;
+    if (!idf_esim_internal::parse_tlv_span(
+            encoded_response, root_end, pos, choice, safe_message) || pos != root_end) {
+        encoded_response.clear();
         safe_message = "RetrieveNotificationsList 响应 choice 无效";
         return ESP_ERR_INVALID_RESPONSE;
     }
-    const Tlv& choice = root.children.front();
-    if (tag_is(choice, TAG_RESULT_ERROR)) {
-        notifications.clear();
-        if (choice.value.size() == 1U && choice.value[0] == 127U) {
-            safe_message = "eUICC 无法检索待发送安装通知";
+
+    if (idf_esim_internal::tag_is(encoded_response, choice, TAG_RESULT_ERROR)) {
+        if (choice.valueLength == 1U && encoded_response[choice.valueOffset] == 127U) {
+            safe_message = "eUICC 无法检索待发送通知";
         } else {
             safe_message = "RetrieveNotificationsList 错误结果无效";
         }
+        encoded_response.clear();
         return ESP_ERR_INVALID_RESPONSE;
     }
-    if (!tag_is(choice, TAG_NOTIFICATION_LIST)) {
-        notifications.clear();
+    if (!idf_esim_internal::tag_is(encoded_response, choice, TAG_NOTIFICATION_LIST)) {
+        encoded_response.clear();
         safe_message = "RetrieveNotificationsList 成功结果无效";
         return ESP_ERR_INVALID_RESPONSE;
     }
-
-    for (const Tlv& notification : choice.children) {
-        if (!tag_is(notification, TAG_INSTALLATION_RESULT)) {
-            safe_message = "RetrieveNotificationsList 返回了非安装类通知";
-            return ESP_ERR_INVALID_RESPONSE;
-        }
-    }
-    notifications.reserve(choice.children.size());
-    for (const Tlv& notification : choice.children) {
-        std::vector<uint8_t> encoded;
-        append_tlv(encoded, notification.tag.data(), notification.tag.size(), notification.value);
-        notifications.push_back(std::move(encoded));
-    }
+    list_offset = choice.valueOffset;
+    list_length = choice.valueLength;
     return ESP_OK;
 }
 
@@ -1221,10 +1216,10 @@ esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
             return ESP_OK;
         case 0x01:
             // 服务器已确认通知，卡侧目标状态已满足；重复清理应保持幂等成功。
-            idf_log_line("eSIM 待处理安装通知已不在卡侧列表中");
+            idf_log_line("eSIM 待处理通知已不在卡侧列表中");
             return ESP_OK;
         case 0x7F:
-            safe_message = "eUICC 删除待处理安装通知失败";
+            safe_message = "eUICC 删除待处理通知失败";
             return ESP_FAIL;
         default:
             safe_message = "RemoveNotificationFromList 返回未知状态";

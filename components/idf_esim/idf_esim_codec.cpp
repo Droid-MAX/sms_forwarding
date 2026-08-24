@@ -47,63 +47,23 @@ static bool parse_tlv_one(const std::vector<uint8_t>& data,
         message = "TLV 嵌套过深";
         return false;
     }
-    if (pos >= end) {
-        message = "TLV 数据为空";
-        return false;
-    }
-
-    size_t tag_start = pos;
-    uint8_t first = data[pos++];
+    TlvSpan span;
+    if (!parse_tlv_span(data, end, pos, span, message)) return false;
     out = Tlv();
-    out.constructed = (first & 0x20U) != 0;
-    if ((first & 0x1FU) == 0x1FU) {
-        bool tag_complete = false;
-        while (pos < end) {
-            uint8_t current = data[pos++];
-            if ((current & 0x80U) == 0) {
-                tag_complete = true;
-                break;
-            }
-        }
-        if (!tag_complete) {
-            message = "TLV tag 不完整";
-            return false;
-        }
-    }
-    out.tag.assign(data.begin() + tag_start, data.begin() + pos);
-
-    if (pos >= end) {
-        message = "TLV length 缺失";
-        return false;
-    }
-    uint8_t len0 = data[pos++];
-    size_t len = 0;
-    if ((len0 & 0x80U) == 0) {
-        len = len0;
-    } else {
-        size_t count = len0 & 0x7FU;
-        if (count == 0 || count > 3 || pos + count > end) {
-            message = "TLV length 格式不支持";
-            return false;
-        }
-        for (size_t i = 0; i < count; ++i) len = (len << 8U) | data[pos++];
-    }
-    if (len > end - pos) {
-        message = "TLV length 超出响应";
-        return false;
-    }
-
-    out.value.assign(data.begin() + pos, data.begin() + pos + len);
+    out.constructed = (data[span.offset] & 0x20U) != 0U;
+    out.tag.assign(data.begin() + span.offset,
+                   data.begin() + span.offset + span.tagLength);
+    out.value.assign(data.begin() + span.valueOffset,
+                     data.begin() + span.valueOffset + span.valueLength);
     if (out.constructed) {
-        size_t child_pos = pos;
-        size_t child_end = pos + len;
+        size_t child_pos = span.valueOffset;
+        size_t child_end = span.valueOffset + span.valueLength;
         while (child_pos < child_end) {
             Tlv child;
             if (!parse_tlv_one(data, child_end, child_pos, child, message, depth + 1)) return false;
             out.children.push_back(std::move(child));
         }
     }
-    pos += len;
     return true;
 }
 
@@ -241,10 +201,85 @@ bool tag_is(const Tlv& tlv, const uint8_t* tag, size_t len)
     return tlv.tag.size() == len && memcmp(tlv.tag.data(), tag, len) == 0;
 }
 
+bool tag_is(const std::vector<uint8_t>& data,
+            const TlvSpan& tlv,
+            const uint8_t* tag,
+            size_t len)
+{
+    return tag && tlv.tagLength == len && tlv.offset + len <= data.size() &&
+           memcmp(data.data() + tlv.offset, tag, len) == 0;
+}
+
+bool parse_tlv_span(const std::vector<uint8_t>& data,
+                    size_t end,
+                    size_t& pos,
+                    TlvSpan& out,
+                    std::string& message)
+{
+    if (end > data.size() || pos >= end) {
+        message = "TLV 数据为空";
+        return false;
+    }
+
+    const size_t tag_start = pos;
+    const uint8_t first = data[pos++];
+    if ((first & 0x1FU) == 0x1FU) {
+        bool tag_complete = false;
+        while (pos < end) {
+            if ((data[pos++] & 0x80U) == 0U) {
+                tag_complete = true;
+                break;
+            }
+        }
+        if (!tag_complete) {
+            message = "TLV tag 不完整";
+            return false;
+        }
+    }
+    const size_t tag_length = pos - tag_start;
+    if (pos >= end) {
+        message = "TLV length 缺失";
+        return false;
+    }
+
+    const uint8_t len0 = data[pos++];
+    size_t length = 0;
+    if ((len0 & 0x80U) == 0U) {
+        length = len0;
+    } else {
+        const size_t count = len0 & 0x7FU;
+        if (count == 0U || count > 3U || count > end - pos) {
+            message = "TLV length 格式不支持";
+            return false;
+        }
+        for (size_t i = 0; i < count; ++i) length = (length << 8U) | data[pos++];
+    }
+    if (length > end - pos) {
+        message = "TLV length 超出响应";
+        return false;
+    }
+
+    out.offset = tag_start;
+    out.tagLength = tag_length;
+    out.valueOffset = pos;
+    out.valueLength = length;
+    pos += length;
+    return true;
+}
+
+bool parse_tlv_at(const std::vector<uint8_t>& data,
+                  size_t end,
+                  size_t& pos,
+                  Tlv& out,
+                  std::string& message)
+{
+    return parse_tlv_one(data, end, pos, out, message, 0);
+}
+
 bool parse_tlv(const std::vector<uint8_t>& data, Tlv& out, std::string& message)
 {
     size_t pos = 0;
-    if (!parse_tlv_one(data, data.size(), pos, out, message, 0)) return false;
+    if (!parse_tlv_at(data, data.size(), pos, out, message)) return false;
     if (pos != data.size()) {
         message = "TLV 响应含有多余数据";
         return false;

@@ -222,20 +222,6 @@ public:
     std::vector<uint8_t> value;
 };
 
-class SensitiveByteArrays {
-public:
-    SensitiveByteArrays() = default;
-    SensitiveByteArrays(const SensitiveByteArrays&) = delete;
-    SensitiveByteArrays& operator=(const SensitiveByteArrays&) = delete;
-    ~SensitiveByteArrays()
-    {
-        for (std::vector<uint8_t>& value : values) clear_sensitive_bytes(value);
-        std::vector<std::vector<uint8_t>>().swap(values);
-    }
-
-    std::vector<std::vector<uint8_t>> values;
-};
-
 static bool equal_ascii_ci(const std::string& left, const char* right)
 {
     if (!right || left.size() != strlen(right)) return false;
@@ -649,6 +635,63 @@ static bool json_get_string(const std::string& json,
     return required ? count == 1U : count <= 1U;
 }
 
+static bool valid_status_code_token(const std::string& value)
+{
+    if (value.empty() || value.size() > 32U) return false;
+    bool need_digit = true;
+    for (char ch : value) {
+        if (ch == '.') {
+            if (need_digit) return false;
+            need_digit = true;
+        } else if (ch >= '0' && ch <= '9') {
+            need_digit = false;
+        } else {
+            return false;
+        }
+    }
+    return !need_digit;
+}
+
+static bool json_get_status_code(const std::string& json,
+                                 const char* key,
+                                 std::string& out)
+{
+    out.clear();
+    if (!json_get_string(json, key, out, false) ||
+        !valid_status_code_token(out)) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static const char* safe_es9_status_for_log(const std::string& status)
+{
+    if (status == "Failed") return "Failed";
+    if (status == "Expired") return "Expired";
+    if (status == "Executed-WithWarning") return "Executed-WithWarning";
+    if (status == "Executed-Success") return "Executed-Success";
+    return "other";
+}
+
+static const char* status_code_for_log(const std::string& value)
+{
+    return valid_status_code_token(value) ? value.c_str() :
+           (value.empty() ? "missing" : "invalid");
+}
+
+static void log_es9_failure_status(const char* operation,
+                                   const std::string& status,
+                                   const std::string& subject_code,
+                                   const std::string& reason_code)
+{
+    idf_logf("ES9+ %s status=%s subjectCode=%s reasonCode=%s",
+             operation ? operation : "请求",
+             safe_es9_status_for_log(status),
+             status_code_for_log(subject_code),
+             status_code_for_log(reason_code));
+}
+
 static bool base64_text_valid(const std::string& text)
 {
     if (text.empty() || (text.size() % 4U) != 0U) return false;
@@ -698,16 +741,17 @@ static bool base64_decode_bounded(const std::string& text,
     return true;
 }
 
-static bool base64_encode_bytes(const std::vector<uint8_t>& input,
+static bool base64_encode_bytes(const uint8_t* input,
+                                size_t input_size,
                                 std::string& out,
                                 std::string& message)
 {
     out.clear();
-    size_t capacity = ((input.size() + 2U) / 3U) * 4U + 1U;
+    size_t capacity = ((input_size + 2U) / 3U) * 4U + 1U;
     out.assign(capacity, '\0');
     size_t encoded = 0;
     int rc = mbedtls_base64_encode(reinterpret_cast<unsigned char*>(out.data()), out.size(),
-                                   &encoded, input.data(), input.size());
+                                   &encoded, input, input_size);
     if (rc != 0) {
         out.clear();
         message = "ES9+ Base64 编码失败";
@@ -715,6 +759,13 @@ static bool base64_encode_bytes(const std::vector<uint8_t>& input,
     }
     out.resize(encoded);
     return true;
+}
+
+static bool base64_encode_bytes(const std::vector<uint8_t>& input,
+                                std::string& out,
+                                std::string& message)
+{
+    return base64_encode_bytes(input.data(), input.size(), out, message);
 }
 
 static int hex_value(unsigned char ch)
@@ -947,14 +998,23 @@ static bool build_authenticate_server_request(const LpaActivationCode& activatio
     return true;
 }
 
-static bool parse_success_status(const std::string& json, std::string& message)
+static bool parse_success_status(const std::string& json,
+                                 const char* operation,
+                                 std::string& message)
 {
     SensitiveText status;
     if (!json_get_string(json, "status", status.text, true)) {
+        log_es9_failure_status(operation, "", "", "");
         message = "ES9+ 响应缺少 functionExecutionStatus";
         return false;
     }
     if (status.text != "Executed-Success") {
+        SensitiveText subject_code;
+        SensitiveText reason_code;
+        json_get_status_code(json, "subjectCode", subject_code.text);
+        json_get_status_code(json, "reasonCode", reason_code.text);
+        log_es9_failure_status(operation, status.text,
+                                subject_code.text, reason_code.text);
         // 服务器 status 用于定位协议阶段；不回显服务端 message 或原始响应。
         message = "ES9+ 服务器拒绝请求（";
         message += status.text;
@@ -1167,7 +1227,7 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
                         initiate_response.text,
                         safe_message);
     if (err != ESP_OK) return err;
-    if (!parse_success_status(initiate_response.text, safe_message)) {
+    if (!parse_success_status(initiate_response.text, "InitiateAuthentication", safe_message)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -1268,7 +1328,7 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
                         authenticate_client_response.text,
                         safe_message);
     if (err != ESP_OK) return err;
-    if (!parse_success_status(authenticate_client_response.text, safe_message)) {
+    if (!parse_success_status(authenticate_client_response.text, "AuthenticateClient", safe_message)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     SensitiveText response_transaction_text;
@@ -2099,21 +2159,12 @@ private:
 class BppJsonStreamScanner {
 public:
     BppJsonStreamScanner(BppStreamParser& parser,
-                         std::string& message,
-                         const std::string& expected_transaction_id)
-        : parser_(parser), decoder_(parser), message_(message)
-    {
-        expected_transaction_id_.text = expected_transaction_id;
-    }
+                         std::string& message)
+        : parser_(parser), decoder_(parser), message_(message) {}
 
     esp_err_t feed(const char* data, size_t length)
     {
         if (!data && length != 0) return fail("ES9+ BPP 响应为空");
-        if (response_bytes_ > kMaxBppEncodedBytes + 64U * 1024U ||
-            length > kMaxBppEncodedBytes + 64U * 1024U - response_bytes_) {
-            return fail("ES9+ BPP 响应超过大小上限");
-        }
-        response_bytes_ += length;
         for (size_t i = 0; i < length; ++i) {
             esp_err_t err = consume(data[i]);
             if (err != ESP_OK) return err;
@@ -2129,17 +2180,14 @@ public:
         // 根据 status 生成业务错误，不能把它误判成 Base64/DER 错误。
         if (status_ != "Executed-Success") return ESP_OK;
         if (!bpp_seen_) return fail("ES9+ BPP 响应缺少 boundProfilePackage");
-        esp_err_t err = decoder_.finish(message_);
-        if (err != ESP_OK) {
-            failure_stage_ = "base64";
-            return err;
-        }
-        err = parser_.finish(message_);
+        esp_err_t err = parser_.finish(message_);
         if (err != ESP_OK) failure_stage_ = "der";
         return err;
     }
 
     const std::string& status() const { return status_; }
+    const std::string& subject_code() const { return subject_code_; }
+    const std::string& reason_code() const { return reason_code_; }
     const std::string& transaction_id() const { return transaction_id_.text; }
     size_t encoded_bpp_chars() const { return decoder_.encoded_chars(); }
     size_t decoded_bpp_bytes() const { return parser_.decoded_bytes(); }
@@ -2171,7 +2219,8 @@ private:
                     return fail("ES9+ BPP Base64 不允许 JSON escape");
                 }
                 if (role_ == StringRole::value &&
-                    (current_key_ == "status" || current_key_ == "transactionId")) {
+                    (current_key_ == "status" || current_key_ == "transactionId" ||
+                     current_key_ == "subjectCode" || current_key_ == "reasonCode")) {
                     if (!append_small(static_cast<char>(ch))) return fail("ES9+ BPP 字段过长");
                 }
                 return ESP_OK;
@@ -2197,17 +2246,16 @@ private:
                 token_.push_back(ch);
             } else if (role_ == StringRole::value) {
                 if (current_key_ == "boundProfilePackage") {
-                    if (!bpp_metadata_validated_) {
-                        esp_err_t metadata_err = validate_bpp_metadata();
-                        if (metadata_err != ESP_OK) return metadata_err;
-                    }
+                    // 实际服务可能先返回 BPP；这里不按 JSON 字段顺序阻断写卡，
+                    // status 和 transactionId 在响应完成后由下载主流程统一校验。
                     const size_t decoded_before = parser_.input_bytes();
                     esp_err_t err = decoder_.feed(ch, message_);
                     if (err != ESP_OK) {
                         failure_stage_ = parser_.input_bytes() != decoded_before ? "der" : "base64";
                         return err;
                     }
-                } else if (current_key_ == "status" || current_key_ == "transactionId") {
+                } else if (current_key_ == "status" || current_key_ == "transactionId" ||
+                           current_key_ == "subjectCode" || current_key_ == "reasonCode") {
                     if (!append_small(ch)) return fail("ES9+ BPP 字段过长");
                 }
             }
@@ -2259,6 +2307,12 @@ private:
             if (status_seen_) return fail("ES9+ BPP functionExecutionStatus 重复");
             status_ = value_;
             status_seen_ = true;
+        } else if (current_key_ == "subjectCode") {
+            if (!subject_code_.empty()) return fail("ES9+ BPP subjectCode 重复");
+            subject_code_ = value_;
+        } else if (current_key_ == "reasonCode") {
+            if (!reason_code_.empty()) return fail("ES9+ BPP reasonCode 重复");
+            reason_code_ = value_;
         } else if (current_key_ == "transactionId") {
             if (transaction_seen_) return fail("ES9+ BPP transactionId 重复");
             clear_string(transaction_id_.text);
@@ -2277,24 +2331,6 @@ private:
         return ESP_OK;
     }
 
-    esp_err_t validate_bpp_metadata()
-    {
-        if (!status_seen_ || status_ != "Executed-Success" || !transaction_seen_ ||
-            transaction_id_.text.empty()) {
-            return fail("ES9+ BPP 在响应状态和 transactionId 校验前出现");
-        }
-        std::vector<uint8_t> actual;
-        std::vector<uint8_t> expected;
-        std::string decode_message;
-        if (!decode_transaction_id(transaction_id_.text, actual, decode_message) ||
-            !decode_transaction_id(expected_transaction_id_.text, expected, decode_message) ||
-            actual != expected) {
-            return fail("ES9+ BPP transactionId 不匹配");
-        }
-        bpp_metadata_validated_ = true;
-        return ESP_OK;
-    }
-
     BppStreamParser& parser_;
     BppBase64Decoder decoder_;
     std::string& message_;
@@ -2303,17 +2339,16 @@ private:
     std::string current_key_;
     std::string value_;
     std::string status_;
+    std::string subject_code_;
+    std::string reason_code_;
     SensitiveText transaction_id_;
-    SensitiveText expected_transaction_id_;
     const char* failure_stage_ = "none";
-    size_t response_bytes_ = 0;
     bool in_string_ = false;
     bool escape_ = false;
     bool awaiting_value_ = false;
     bool status_seen_ = false;
     bool transaction_seen_ = false;
     bool bpp_seen_ = false;
-    bool bpp_metadata_validated_ = false;
     StringRole role_ = StringRole::none;
 };
 
@@ -2516,6 +2551,8 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
     err = scanner.finish();
     if (err != ESP_OK) return err;
     if (scanner.status() != "Executed-Success") {
+        log_es9_failure_status("GetBPP", scanner.status(),
+                               scanner.subject_code(), scanner.reason_code());
         message = "ES9+ 服务器拒绝请求（";
         message += scanner.status();
         message += "）";
@@ -2700,7 +2737,64 @@ struct ProfileInstallationResultInfo {
     bool installationSucceeded = false;
 };
 
+static bool parse_notification_metadata(const idf_esim_internal::Tlv& metadata,
+                                        bool require_install,
+                                        std::string& address_text,
+                                        uint32_t& sequence_number,
+                                        std::string& message)
+{
+    static constexpr uint8_t TAG_METADATA[] = {0xBF, 0x2F};
+    static constexpr uint8_t TAG_SEQUENCE[] = {0x80};
+    static constexpr uint8_t TAG_OPERATION[] = {0x81};
+    static constexpr uint8_t TAG_ADDRESS[] = {0x0C};
+    if (!idf_esim_internal::tag_is(metadata, TAG_METADATA)) {
+        message = "NotificationMetadata tag 无效";
+        return false;
+    }
+
+    bool duplicate_sequence = false;
+    bool duplicate_operation = false;
+    bool duplicate_address = false;
+    const idf_esim_internal::Tlv* seq = unique_child(
+        metadata, TAG_SEQUENCE, sizeof(TAG_SEQUENCE), duplicate_sequence);
+    const idf_esim_internal::Tlv* operation = unique_child(
+        metadata, TAG_OPERATION, sizeof(TAG_OPERATION), duplicate_operation);
+    const idf_esim_internal::Tlv* address = unique_child(
+        metadata, TAG_ADDRESS, sizeof(TAG_ADDRESS), duplicate_address);
+    if (duplicate_sequence || duplicate_operation || duplicate_address || !seq ||
+        seq->value.empty() || seq->value.size() > 4U || (seq->value.front() & 0x80U) != 0U ||
+        !operation || operation->value.size() != 2U || !address || address->value.empty()) {
+        message = "NotificationMetadata 字段无效";
+        return false;
+    }
+
+    // NotificationEvent 在 v2.x 中只有 install/enable/disable/delete 四个单比特值。
+    const uint16_t operation_value = static_cast<uint16_t>(operation->value[0]) << 8U |
+                                     operation->value[1];
+    if ((operation_value != 0x0780U && operation_value != 0x0640U &&
+         operation_value != 0x0520U && operation_value != 0x0410U) ||
+        (require_install && operation_value != 0x0780U)) {
+        message = "NotificationMetadata operation 无效";
+        return false;
+    }
+
+    address_text.assign(reinterpret_cast<const char*>(address->value.data()),
+                        address->value.size());
+    std::string host_message;
+    if (!is_printable_ascii(address_text) || !valid_smdp_host(address_text, host_message)) {
+        message = "NotificationMetadata 地址无效";
+        return false;
+    }
+    sequence_number = 0;
+    for (uint8_t byte : seq->value) {
+        sequence_number = (sequence_number << 8U) | byte;
+    }
+    return true;
+}
+
 static bool parse_profile_installation_result(const std::vector<uint8_t>& pir,
+                                              size_t offset,
+                                              size_t length,
                                               ProfileInstallationResultInfo& result,
                                               std::string& message)
 {
@@ -2709,14 +2803,17 @@ static bool parse_profile_installation_result(const std::vector<uint8_t>& pir,
     static constexpr uint8_t TAG_METADATA[] = {0xBF, 0x2F};
     static constexpr uint8_t TAG_SMDP_OID[] = {0x06};
     static constexpr uint8_t TAG_TRANSACTION[] = {0x80};
-    static constexpr uint8_t TAG_OPERATION[] = {0x81};
-    static constexpr uint8_t TAG_ADDRESS[] = {0x0C};
-    static constexpr uint8_t TAG_SEQUENCE[] = {0x80};
     static constexpr uint8_t TAG_FINAL_RESULT[] = {0xA2};
     static constexpr uint8_t TAG_SUCCESS[] = {0xA0};
     static constexpr uint8_t TAG_SIGNATURE[] = {0x5F, 0x37};
+    if (offset > pir.size() || length > pir.size() - offset) {
+        message = "ProfileInstallationResult 范围无效";
+        return false;
+    }
+    size_t pos = offset;
+    const size_t end = offset + length;
     idf_esim_internal::Tlv root;
-    if (!idf_esim_internal::parse_tlv(pir, root, message) ||
+    if (!idf_esim_internal::parse_tlv_at(pir, end, pos, root, message) || pos != end ||
         !idf_esim_internal::tag_is(root, TAG_PIR)) {
         message = "ProfileInstallationResult tag 无效";
         return false;
@@ -2750,33 +2847,9 @@ static bool parse_profile_installation_result(const std::vector<uint8_t>& pir,
         return false;
     }
     result.transactionId.value = transaction->value;
-    bool duplicate_sequence = false;
-    bool duplicate_operation = false;
-    bool duplicate_address = false;
-    const idf_esim_internal::Tlv* seq = unique_child(
-        *metadata, TAG_SEQUENCE, sizeof(TAG_SEQUENCE), duplicate_sequence);
-    const idf_esim_internal::Tlv* operation = unique_child(
-        *metadata, TAG_OPERATION, sizeof(TAG_OPERATION), duplicate_operation);
-    const idf_esim_internal::Tlv* address = unique_child(
-        *metadata, TAG_ADDRESS, sizeof(TAG_ADDRESS), duplicate_address);
-    if (duplicate_sequence || duplicate_operation || duplicate_address || !seq ||
-        seq->value.empty() || seq->value.size() > 4U || (seq->value.front() & 0x80U) != 0U ||
-        !operation || operation->value.size() != 2U || operation->value[0] > 7U ||
-        operation->value[1] != 0x80U || !address || address->value.empty()) {
-        message = "ProfileInstallationResult sequence number 无效";
+    if (!parse_notification_metadata(*metadata, true, result.notificationAddress.text,
+                                     result.sequenceNumber, message)) {
         return false;
-    }
-    result.notificationAddress.text.assign(reinterpret_cast<const char*>(address->value.data()),
-                                           address->value.size());
-    std::string host_message;
-    if (!is_printable_ascii(result.notificationAddress.text) ||
-        !valid_smdp_host(result.notificationAddress.text, host_message)) {
-        message = "ProfileInstallationResult notification 地址无效";
-        return false;
-    }
-    result.sequenceNumber = 0;
-    for (uint8_t byte : seq->value) {
-        result.sequenceNumber = (result.sequenceNumber << 8U) | byte;
     }
     static constexpr uint8_t TAG_AID[] = {0x4F};
     static constexpr uint8_t TAG_ERROR[] = {0xA1};
@@ -2828,42 +2901,111 @@ static esp_err_t es9_post_notification(const std::string& host,
     if (err != ESP_OK) {
         return err;
     }
-    if (!response.text.empty() && !parse_success_status(response.text, message)) {
+    if (!response.text.empty() &&
+        !parse_success_status(response.text, "HandleNotification", message)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     return ESP_OK;
 }
 
-struct PendingInstallationNotification {
-    size_t payloadIndex = 0;
+struct PendingNotification {
+    size_t payloadOffset = 0;
+    size_t payloadLength = 0;
     uint32_t sequenceNumber = 0;
     std::string address;
 };
 
-static esp_err_t recover_pending_installation_notifications(
+static bool parse_pending_notification(const std::vector<uint8_t>& response,
+                                       const idf_esim_internal::TlvSpan& payload,
+                                       PendingNotification& pending,
+                                       std::string& message)
+{
+    static constexpr uint8_t TAG_INSTALLATION_RESULT[] = {0xBF, 0x37};
+    static constexpr uint8_t TAG_OTHER_NOTIFICATION[] = {0x30};
+    static constexpr uint8_t TAG_METADATA[] = {0xBF, 0x2F};
+    if (idf_esim_internal::tag_is(response, payload, TAG_INSTALLATION_RESULT)) {
+        ProfileInstallationResultInfo info;
+        if (!parse_profile_installation_result(
+                response, payload.offset, payload.encoded_length(), info, message)) return false;
+        pending.payloadOffset = payload.offset;
+        pending.payloadLength = payload.encoded_length();
+        pending.sequenceNumber = info.sequenceNumber;
+        pending.address = info.notificationAddress.text;
+        return true;
+    }
+
+    if (!idf_esim_internal::tag_is(response, payload, TAG_OTHER_NOTIFICATION)) {
+        message = "PendingNotification 类型无效";
+        return false;
+    }
+
+    bool duplicate_metadata = false;
+    bool found_metadata = false;
+    idf_esim_internal::TlvSpan metadata_span;
+    size_t pos = payload.valueOffset;
+    const size_t root_end = payload.valueOffset + payload.valueLength;
+    while (pos < root_end) {
+        idf_esim_internal::TlvSpan child;
+        if (!idf_esim_internal::parse_tlv_span(response, root_end, pos, child, message)) {
+            message = "OtherSignedNotification DER 无效";
+            return false;
+        }
+        if (idf_esim_internal::tag_is(response, child, TAG_METADATA)) {
+            if (found_metadata) duplicate_metadata = true;
+            found_metadata = true;
+            metadata_span = child;
+        }
+    }
+
+    if (duplicate_metadata || !found_metadata) {
+        message = "OtherSignedNotification 元数据无效";
+        return false;
+    }
+    pos = metadata_span.offset;
+    const size_t metadata_end = metadata_span.offset + metadata_span.encoded_length();
+    idf_esim_internal::Tlv metadata;
+    if (!idf_esim_internal::parse_tlv_at(response, metadata_end, pos, metadata, message) ||
+        pos != metadata_end ||
+        !parse_notification_metadata(metadata, false, pending.address,
+                                     pending.sequenceNumber, message)) {
+        if (message.empty()) message = "OtherSignedNotification 元数据无效";
+        return false;
+    }
+    pending.payloadOffset = payload.offset;
+    pending.payloadLength = payload.encoded_length();
+    return true;
+}
+
+static esp_err_t recover_pending_notifications(
+    const std::string& current_host,
     bool allow_missing_protocol,
     const LpaDownloadObserver& observer,
     std::string& message)
 {
-    SensitiveByteArrays payloads;
-    esp_err_t err = idf_esim_lpa_retrieve_installation_notifications(payloads.values, message);
-    if (err != ESP_OK || payloads.values.empty()) return err;
+    SensitiveBytes response;
+    size_t list_offset = 0;
+    size_t list_length = 0;
+    esp_err_t err = idf_esim_lpa_retrieve_notifications(
+        response.value, list_offset, list_length, message);
+    if (err != ESP_OK || list_length == 0U) return err;
 
-    std::vector<PendingInstallationNotification> pending;
-    pending.reserve(payloads.values.size());
-    for (size_t i = 0; i < payloads.values.size(); ++i) {
-        ProfileInstallationResultInfo info;
-        if (!parse_profile_installation_result(payloads.values[i], info, message)) {
+    std::vector<PendingNotification> pending;
+    size_t pos = list_offset;
+    const size_t list_end = list_offset + list_length;
+    while (pos < list_end) {
+        idf_esim_internal::TlvSpan payload;
+        if (!idf_esim_internal::parse_tlv_span(
+                response.value, list_end, pos, payload, message)) {
             return ESP_ERR_INVALID_RESPONSE;
         }
-        PendingInstallationNotification notification;
-        notification.payloadIndex = i;
-        notification.sequenceNumber = info.sequenceNumber;
-        notification.address = info.notificationAddress.text;
+        PendingNotification notification;
+        if (!parse_pending_notification(response.value, payload, notification, message)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         pending.push_back(std::move(notification));
     }
-    auto notification_less = [](const PendingInstallationNotification& left,
-                                const PendingInstallationNotification& right) {
+    auto notification_less = [](const PendingNotification& left,
+                                const PendingNotification& right) {
         const int address_order = compare_ascii_ci(left.address, right.address);
         return address_order != 0
             ? address_order < 0
@@ -2871,7 +3013,7 @@ static esp_err_t recover_pending_installation_notifications(
     };
     // 卡侧 pending list 很小，原地插入排序比 std::sort 的模板代码和临时小写字符串更省空间。
     for (size_t i = 1; i < pending.size(); ++i) {
-        PendingInstallationNotification current = std::move(pending[i]);
+        PendingNotification current = std::move(pending[i]);
         size_t insert_at = i;
         while (insert_at > 0 && notification_less(current, pending[insert_at - 1U])) {
             pending[insert_at] = std::move(pending[insert_at - 1U]);
@@ -2887,29 +3029,63 @@ static esp_err_t recover_pending_installation_notifications(
         }
     }
 
-    for (const PendingInstallationNotification& notification : pending) {
-        download_phase(observer, "recover_notification", "正在重发待处理 eUICC 通知");
-        SensitiveText notification_b64;
-        if (!base64_encode_bytes(payloads.values[notification.payloadIndex],
-                                 notification_b64.text, message)) {
-            return ESP_ERR_INVALID_SIZE;
+    size_t sent_count = 0;
+    size_t deferred_groups = 0;
+    esp_err_t current_host_error = ESP_OK;
+    std::string current_host_message;
+    size_t group_begin = 0;
+    // 同一 SM-DP+ 必须按序发送；组内一项失败后保留其余通知等待下次恢复。
+    // 不同 SM-DP+ 相互独立，只有当前下载目标组失败才阻止创建新的同组通知。
+    while (group_begin < pending.size()) {
+        size_t group_end = group_begin + 1U;
+        while (group_end < pending.size() &&
+               compare_ascii_ci(pending[group_begin].address, pending[group_end].address) == 0) {
+            ++group_end;
         }
-        SensitiveText request;
-        bool first = true;
-        request.text.push_back('{');
-        append_json_field(request.text, "pendingNotification", notification_b64.text, first);
-        request.text.push_back('}');
-        clear_string(notification_b64.text);
-        err = es9_post_notification(notification.address, allow_missing_protocol,
-                                    request.text, message);
-        clear_string(request.text);
-        if (err != ESP_OK) return err;
 
-        err = idf_esim_lpa_remove_notification(notification.sequenceNumber, message);
-        if (err != ESP_OK) return err;
+        esp_err_t group_error = ESP_OK;
+        for (size_t i = group_begin; i < group_end; ++i) {
+            const PendingNotification& notification = pending[i];
+            download_phase(observer, "recover_notification", "正在重发待处理 eUICC 通知");
+            SensitiveText notification_b64;
+            if (!base64_encode_bytes(response.value.data() + notification.payloadOffset,
+                                     notification.payloadLength,
+                                     notification_b64.text, message)) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            SensitiveText request;
+            bool first = true;
+            request.text.push_back('{');
+            append_json_field(request.text, "pendingNotification", notification_b64.text, first);
+            request.text.push_back('}');
+            clear_string(notification_b64.text);
+            group_error = es9_post_notification(notification.address, allow_missing_protocol,
+                                                request.text, message);
+            clear_string(request.text);
+            if (group_error != ESP_OK) break;
+
+            group_error = idf_esim_lpa_remove_notification(notification.sequenceNumber, message);
+            if (group_error != ESP_OK) break;
+            ++sent_count;
+        }
+        if (group_error != ESP_OK) {
+            ++deferred_groups;
+            idf_logf("eSIM pending notification group deferred: result=%s",
+                     esp_err_to_name(group_error));
+            if (compare_ascii_ci(pending[group_begin].address, current_host) == 0) {
+                current_host_error = group_error;
+                current_host_message = message;
+            }
+        }
+        group_begin = group_end;
     }
-    idf_logf("eSIM pending notification recovery: count=%u",
-             static_cast<unsigned>(pending.size()));
+    idf_logf("eSIM pending notification recovery: sent=%u deferredGroups=%u",
+             static_cast<unsigned>(sent_count), static_cast<unsigned>(deferred_groups));
+    if (current_host_error != ESP_OK) {
+        message = current_host_message;
+        return current_host_error;
+    }
+    message.clear();
     return ESP_OK;
 }
 
@@ -2956,8 +3132,8 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
         return failed(ESP_ERR_INVALID_ARG);
     }
     download_phase(observer, "recover_notifications", "正在检查待处理 eUICC 通知");
-    esp_err_t err = recover_pending_installation_notifications(
-        observer.allow_missing_admin_protocol, observer, safe_message);
+    esp_err_t err = recover_pending_notifications(
+        activation_code.smdpHost, observer.allow_missing_admin_protocol, observer, safe_message);
     if (err != ESP_OK) return failed(err);
 
     download_phase(observer, "authentication", "正在完成 SM-DP+ 认证");
@@ -3017,11 +3193,12 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
     append_json_field(get_bpp_request.text, "transactionId", transaction_hex.text, first);
     append_json_field(get_bpp_request.text, "prepareDownloadResponse", prepare_b64.text, first);
     get_bpp_request.text.push_back('}');
+    clear_string(transaction_hex.text);
     clear_string(prepare_b64.text);
 
     download_phase(observer, "get_bpp", "正在获取并写入 Profile");
     BppStreamParser bpp_parser;
-    BppJsonStreamScanner bpp_json(bpp_parser, safe_message, transaction_hex.text);
+    BppJsonStreamScanner bpp_json(bpp_parser, safe_message);
     SensitiveText response_transaction_id;
     err = es9_post_json_bpp(activation_code.smdpHost,
                             observer.allow_missing_admin_protocol,
@@ -3045,7 +3222,8 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
     SensitiveBytes pir;
     pir.value = bpp_parser.installation_result();
     ProfileInstallationResultInfo pir_info;
-    if (!parse_profile_installation_result(pir.value, pir_info, safe_message)) {
+    if (!parse_profile_installation_result(
+            pir.value, 0, pir.value.size(), pir_info, safe_message)) {
         return failed(ESP_ERR_INVALID_RESPONSE);
     }
     if (pir_info.transactionId.value != session.transactionId.value) {
